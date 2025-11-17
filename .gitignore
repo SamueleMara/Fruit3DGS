@@ -1,0 +1,12 @@
+# Ignore unwanted folders
+data/temp/
+logs/
+SIBR_viewers/
+submodules/fused-ssim/
+submodules/simple-knn/
+*.pyc
+.vscode
+output
+build
+tensorboard_3d
+screenshots
