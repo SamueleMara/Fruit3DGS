@@ -1,5 +1,8 @@
 import os
+import time
 import torch
+import torch.nn.functional as F
+
 from scene import Scene
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
@@ -9,27 +12,37 @@ from utils.read_write_model import read_model
 from utils.general_utils import safe_state, get_expon_lr_func
 from utils.loss_utils import total_cluster_loss
 from utils import cluster_utils
-from utils.visualize_clusters import visualize_clusters_from_ply
+from utils.visualize_clusters import visualize_clusters_from_ply, visualize_colmap_clusters
 from gaussian_renderer import render
 
 from tqdm import tqdm
 
+from skopt.space import Real
+from skopt.utils import use_named_args
+from skopt import Optimizer
 
 # -----------------------------
-# Scene initialization
+# Scene Initialization
 # -----------------------------
-def initialize_scene(colmap_dir, model_dir, mask_inst_dir, load_iteration=30000):
+def initialize_scene(colmap_dir, model_dir, mask_inst_dir, load_iteration=-1,num_its_BO=20):
     """
-    Initialize the main Scene and also retrieve the COLMAP-seeded Gaussian model.
-    
-    Returns:
-        scene: Scene instance (trained model loaded if available)
-        dataset: configuration Namespace
-        colmap_seed_gaussians: GaussianModel initialized from COLMAP point cloud
+    Initialize a Scene and optionally load a trained segmented Gaussian model and COLMAP-seeded Gaussians.
+
+    Inputs:
+        colmap_dir (str): Path to COLMAP reconstruction directory.
+        model_dir (str): Path to Gaussian splatting model directory.
+        mask_inst_dir (str): Path to mask instances directory.
+        load_iteration (int): Iteration index of the trained model to load (-1 = latest).
+
+    Outputs:
+        scene (Scene): Scene object containing all Gaussians and cameras.
+        dataset (Namespace): Model parameter namespace.
+        colmap_seed_gaussians (GaussianModel): COLMAP-seeded Gaussian model.
+        trained_gs_seg (GaussianModel): Segmented Gaussian model (loaded if available).
+
+    Debug helpers:
+        Prints info about loaded Gaussian models and number of segmented Gaussians.
     """
-    # -----------------------------
-    # Parse arguments
-    # -----------------------------
     parser = ArgumentParser()
     model_args = ModelParams(parser)
 
@@ -43,7 +56,6 @@ def initialize_scene(colmap_dir, model_dir, mask_inst_dir, load_iteration=30000)
     model_args.data_device = "cuda"
     model_args.eval = False
 
-    # Wrap in Namespace for Scene compatibility
     dataset = Namespace(
         sh_degree=model_args.sh_degree,
         source_path=model_args._source_path,
@@ -57,353 +69,281 @@ def initialize_scene(colmap_dir, model_dir, mask_inst_dir, load_iteration=30000)
         eval=model_args.eval
     )
 
-    # -----------------------------
-    # Initialize trained scene
-    # -----------------------------
     gaussians = GaussianModel(sh_degree=dataset.sh_degree)
-    scene = Scene(dataset, gaussians,
-                  load_iteration=load_iteration,
-                  shuffle=False,
-                  resolution_scales=[1.0])
+    scene = Scene(dataset, gaussians, load_iteration=load_iteration, shuffle=False, resolution_scales=[1.0])
 
-    # -----------------------------
-    # Load COLMAP-seeded Gaussians for clustering initialization
-    # -----------------------------
     print("[INFO] Loading COLMAP-seeded Gaussian model...")
     trained_gs_seg, colmap_seed_gaussians, scene_info = scene.load_with_colmap_seed(
         args=dataset,
         load_iteration=load_iteration,
-        mask_dir=mask_inst_dir
+        mask_dir=mask_inst_dir,
+        num_its_BO=num_its_BO,
+        bo_optimize=True
     )
 
-    print("[OK] Scene initialized.")
-    if trained_gs_seg is not None:
-        print(f" - Loaded trained Segmented Gaussians: {trained_gs_seg.get_xyz.shape[0]} points")
-    print(f" - Loaded COLMAP-seed Gaussians: {colmap_seed_gaussians.get_xyz.shape[0]} points")
+    print(f"[OK] Scene initialized. Segmented Gaussians: {trained_gs_seg.get_xyz.shape[0]}")
+    
+    return scene, dataset, colmap_seed_gaussians, trained_gs_seg, scene_info
 
-    return scene, dataset, colmap_seed_gaussians, trained_gs_seg
 
 # -----------------------------
-# Compute top K contributors tensor 
+# Train Dynamic Instances
 # -----------------------------
-def compute_topK_contributors(scene, K=8, bg_color=(0, 0, 0)):
+def train_clusters_dynamic_instance(scene, trained_gs_seg, colmap_seed, r_point_idx, r_gauss_idx, r_vals,
+                                    iterations=500, lr=1e-3, temperature=0.1, max_dist=0.05, debug=False):
     """
-    Compute the top-K contributing pixels for each Gaussian across all training cameras.
+    Initialize and train Gaussian clusters dynamically using responsibilities and COLMAP seeds.
 
-    Args:
-        scene (Scene): Scene object containing Gaussians and cameras.
-        K (int): Number of top contributors to store per Gaussian.
-        bg_color (tuple): Background color used for dummy rendering (RGB).
+    Inputs:
+        scene (Scene): Scene object for context.
+        trained_gs_seg (GaussianModel): Segmented Gaussian model to train.
+        colmap_seed (GaussianModel): COLMAP-seeded Gaussian model for initialization.
+        r_point_idx (LongTensor[R]): Point indices for responsibilities.
+        r_gauss_idx (LongTensor[R]): Gaussian indices for responsibilities.
+        r_vals (FloatTensor[R]): Responsibility weights.
+        iterations (int): Number of training iterations.
+        lr (float): Learning rate for optimizer.
+        temperature (float): Softmax temperature for initialization.
+        max_dist (float): Distance threshold for hard assignment during initialization.
+        debug (bool): Print debug info if True.
 
-    Returns:
-        dict: {
-            "indices": LongTensor [N, num_cameras, K], pixel indices (-1 if none),
-            "opacities": FloatTensor [N, num_cameras, K], 1.0 if contribution exists, else 0
-        }
+    Outputs:
+        xyz_final (FloatTensor[N_seg,3]): Gaussian positions (unchanged)
+        instance_logits_final (FloatTensor[N_seg,G]): Final soft assignments
+        instance_ids_final (LongTensor[N_seg]): Final hard assignments (argmax)
+
+    Debug helpers:
+        - Prints progress bar for training iterations.
+        - Handles NaNs safely in gradient computation.
+        - Final assignments are printed if debug=True.
     """
-    gaussians = scene.gaussians
-    N = gaussians.get_xyz.shape[0]
-    cameras = scene.getTrainCameras()
-    num_cams = len(cameras)
-    device = gaussians.get_xyz.device
-
-    topK_contrib_indices = -torch.ones((N, num_cams, K), dtype=torch.long, device=device)
-    topK_contrib_opacities = torch.zeros((N, num_cams, K), dtype=torch.float32, device=device)
-
-    class DummyPipe:
-        debug = False
-        antialiasing = False
-        compute_cov3D_python = False
-        convert_SHs_python = False
-
-    dummy_pipe = DummyPipe()
-    bg_color_tensor = torch.tensor(bg_color, dtype=torch.float32, device=device)
-
-    for cam_idx, cam in enumerate(tqdm(cameras, desc="Computing top-K contributors")):
-        render_out = render(cam, gaussians, dummy_pipe, bg_color_tensor, contrib=True, K=K)
-
-        if render_out is None or "contrib_indices" not in render_out:
-            print(f"[WARN] No contributor data for {cam.image_name}, skipping.")
-            continue
-
-        contrib_indices = render_out["contrib_indices"]
-        if contrib_indices is None:
-            continue
-
-        H, W, _ = contrib_indices.shape
-        contrib_indices = contrib_indices.view(-1, K)
-
-        valid_mask = contrib_indices >= 0
-        g_ids_valid = contrib_indices[valid_mask]
-        pixel_ids_valid = valid_mask.nonzero(as_tuple=True)[0]
-
-        g_sorted, idx = torch.sort(g_ids_valid)
-        pix_sorted = pixel_ids_valid[idx]
-
-        unique_g = torch.unique_consecutive(g_sorted)
-        start_mask = torch.ones_like(g_sorted, dtype=torch.bool)
-        start_mask[1:] = g_sorted[1:] != g_sorted[:-1]
-        start_idx = torch.nonzero(start_mask, as_tuple=True)[0]
-
-        for g, s in zip(unique_g.tolist(), start_idx.tolist()):
-            end = min(s + K, g_sorted.numel())
-            slots = min(K, end - s)
-            topK_contrib_indices[g, cam_idx, :slots] = pix_sorted[s:s + slots]
-            topK_contrib_opacities[g, cam_idx, :slots] = 1.0
-
-    return {
-        "indices": topK_contrib_indices,
-        "opacities": topK_contrib_opacities
-    }
-
-# ------------------------------------------
-# Cluster-gaussians-modifying training loop
-# ------------------------------------------
-def train_clusters_dynamic(
-    scene, colmap_seed_gaussians, trained_gs_seg, topk_contrib, mask_inst_dir,
-    iterations=500, lr=1e-3,
-    alpha=10.0, semantic_scale=1.0, radius=0.05,
-    merge_distance=0.05, merge_semantic_diff=0.01,
-    max_dispersion=0.05, max_semantic_std=0.1
-):
-    """
-    Train Gaussian clusters dynamically using COLMAP seeds for initialization,
-    **without moving the Gaussian positions**. Only the cluster assignments are refined
-    using semantic + spatial losses, merging, and splitting.
-
-    Args:
-        scene (Scene): Scene object containing Gaussians and cameras
-        colmap_seed_gaussians (GaussianModel): Seed points from COLMAP reconstruction
-        trained_gs_seg (GaussianModel): Segmented Gaussian model
-        topk_contrib (dict): Precomputed top-K pixel contributions per Gaussian
-        mask_inst_dir (str): Instance mask directory
-        iterations (int): Number of optimization iterations
-        lr (float): Learning rate
-        alpha (float): Weight for semantic term in hybrid loss
-        semantic_scale (float): Weight for pseudo-ground-truth semantic loss
-        radius (float): Neighbor radius for hybrid loss
-        merge_distance (float): Distance threshold for merging clusters
-        merge_semantic_diff (float): Semantic threshold for merging
-        max_dispersion (float): Dispersion threshold for splitting clusters
-        max_semantic_std (float): Semantic variance threshold for splitting clusters
-
-    Returns:
-        tuple: (xyz_final, sem_final, cluster_ids)
-    """
-
-    # Gaussian positions are fixed
     gaussians = trained_gs_seg
     device = gaussians.get_xyz.device
 
-    # Only semantic mask is trainable
-    gaussians.get_xyz.requires_grad_(False)
-    gaussians.semantic_mask.requires_grad_(True)
+    # Ensure COLMAP seed has instance_ids
+    if hasattr(colmap_seed, "cluster_ids") and colmap_seed.cluster_ids is not None:
+        colmap_seed.instance_ids = colmap_seed.cluster_ids.to(device)
+    else:
+        colmap_seed.instance_ids = torch.arange(colmap_seed.get_xyz.shape[0], device=device)
 
-    # Initialize clusters from COLMAP seeds (assignment only)
-    gaussians_xyz = gaussians.get_xyz.detach()
-    colmap_points = colmap_seed_gaussians.get_xyz.detach()
-    colmap_cluster_ids = colmap_seed_gaussians.cluster_ids
-
-    cluster_ids, cluster_centroids = cluster_utils.initialize_clusters_from_colmap(
-        gaussians_xyz, colmap_points, colmap_cluster_ids
+    # Initialize instance logits from COLMAP clusters
+    cluster_utils.initialize_gaussian_instances(
+        gaussians,
+        colmap_points=colmap_seed.get_xyz.detach(),
+        colmap_cluster_ids=colmap_seed.instance_ids.detach(),
+        temperature=temperature,
+        max_dist=max_dist
     )
 
-    optimizer = torch.optim.Adam([gaussians.semantic_mask], lr=lr)
-    print(f"[INFO] Initialized {len(torch.unique(cluster_ids))} clusters from COLMAP seeds")
+    gaussians.get_xyz.requires_grad_(False)
+    optimizer = torch.optim.Adam([gaussians.instance_logits], lr=lr)
 
-    N = gaussians.get_xyz.shape[0]
-
-    # ----------------------
-    # Dynamic training loop
-    # ----------------------
-    for it in tqdm(range(iterations), desc="Dynamic Cluster Training"):
+    # Training loop
+    # for it in tqdm(range(iterations), desc="Dynamic Instance Training"):
+    for it in range(iterations):    
         optimizer.zero_grad()
+        q_i = gaussians.instance_logits
+        p_j = torch.softmax(q_i, dim=1)
 
-        # Compute semantic predictions for active Gaussians
-        semantic_pred = torch.sigmoid(gaussians.semantic_mask.squeeze())
-
-        # Compute hybrid + semantic loss (cluster assignments fixed for this iteration)
-        total_loss, hybrid_loss, semantic_loss = total_cluster_loss(
+        total_loss, loss_vals, grad_q = total_cluster_loss(
             gaussians,
-            topK_contrib_indices=topk_contrib["indices"],
-            mask_images=None,  # or your mask images if available
-            alpha=alpha,
-            neighbor_radius=radius,
-            λ_sem=semantic_scale,
+            r_point_idx,
+            r_gauss_idx,
+            r_vals,
+            p_j,
+            q_i,
+            pair_j=None, pair_k=None,
+            A=None, Kmat=None,
+            gaussians_mask=None,
+            contrib_indices=None,
+            contrib_opacities=None,
+            gt_mask=None,
+            alpha_mask=None,
+            use_label_ce=True,
+            use_pair_kl=False,
+            use_prop=False,
+            use_smooth=False,
+            use_marg=False,
+            use_instance_render=False,
+            debug=debug
+        )
+
+        grad_q = torch.nan_to_num(grad_q)
+        q_i.backward(grad_q)
+        optimizer.step()
+
+    # Final hard assignment
+    with torch.no_grad():
+        gaussians.instance_ids = torch.argmax(gaussians.instance_logits, dim=1)
+
+    return gaussians.get_xyz.detach(), gaussians.instance_logits.detach(), gaussians.instance_ids
+
+# -----------------------------
+# Spatially-Aware Score for Dense Clusters
+# -----------------------------
+def spatial_coherence_score(logits, ids, xyz):
+    """
+    Compute a coherence-weighted spatial compactness score for clustered Gaussians.
+
+    Inputs:
+        logits: [N, C] tensor of per-Gaussian instance logits
+        ids:    [N] tensor of final instance IDs (fixed)
+        xyz:    [N, 3] tensor of Gaussian positions
+
+    Returns:
+        score: float, higher means more spatially compact and coherent clusters
+    """
+    device = xyz.device
+    coherence = torch.softmax(logits, dim=1)[torch.arange(len(ids), device=device), ids]
+
+    unique_ids = ids.unique()
+    cluster_scores = []
+
+    for cid in unique_ids:
+        mask = ids == cid
+        if mask.sum() < 2:
+            continue  # skip singleton clusters
+
+        cluster_xyz = xyz[mask]
+        cluster_coh = coherence[mask]
+
+        # pairwise distances
+        diff = cluster_xyz[:, None, :] - cluster_xyz[None, :, :]
+        dists = torch.sqrt((diff ** 2).sum(-1) + 1e-8)
+
+        # weighted intra-cluster distance
+        w = cluster_coh / cluster_coh.sum()
+        weighted_mean_dist = (dists * (w[:, None] @ w[None, :])).sum()
+
+        # normalize by cluster size
+        weighted_mean_dist /= mask.sum() ** 2
+        cluster_scores.append(1.0 / (weighted_mean_dist + 1e-6))  # higher = more compact
+
+    if len(cluster_scores) == 0:
+        return 0.0
+    return torch.stack(cluster_scores).mean().item()
+
+
+# -----------------------------
+# BO Dense Instance Cluster Optimization
+# -----------------------------
+def optimize_dense_instances(scene, trained_gs_seg, colmap_seed, r_point_idx, r_gauss_idx, r_vals,
+                             n_calls=20, iterations=100, lr=5e-4):
+    """
+    Bayesian Optimization over temperature, max_dist, and coherence threshold
+    for dense Gaussian clusters, keeping cluster assignments fixed and
+    favoring spatially compact clusters.
+    """
+
+    # BO search space
+    space = [
+        Real(0.01, 1.0, name='temperature'),
+        Real(0.01, 0.2, name='max_dist'),
+        Real(0.05, 0.9, name='coherence_threshold')
+    ]
+    opt = Optimizer(space, random_state=42)
+    best_score = -float('inf')
+    best_params = None
+
+    xyz_orig = trained_gs_seg.get_xyz.detach().clone()
+    ids_fixed = trained_gs_seg.instance_ids.detach().clone()
+
+    for i in tqdm(range(n_calls), desc="BO Dense Instance Clusters"):
+        temperature, max_dist, coherence_threshold = opt.ask()
+
+        # refine logits without modifying assignments
+        xyz_final, logits_final, _ = train_clusters_dynamic_instance(
+            scene, trained_gs_seg, colmap_seed,
+            r_point_idx, r_gauss_idx, r_vals,
+            iterations=iterations, lr=lr,
+            temperature=temperature, max_dist=max_dist,
             debug=False
         )
 
-        # Backpropagate
-        total_loss.backward()
-        optimizer.step()
+        # spatially aware, coherence-weighted score
+        score = spatial_coherence_score(logits_final, ids_fixed, xyz_orig)
 
-        # -----------------------------
-        # Cluster refinement: merge & split
-        # -----------------------------
-        with torch.no_grad():
+        # maximize the score
+        opt.tell([temperature, max_dist, coherence_threshold], -score)
 
-            # -----------------------------------------
-            # Compute cluster stats
-            # -----------------------------------------
-            num_clusters = int(cluster_ids.max().item() + 1)
+        if score > best_score:
+            best_score = score
+            best_params = (temperature, max_dist, coherence_threshold)
+            best_logits = logits_final.clone().detach()
 
-            cluster_centroids, cluster_semantics, cluster_sizes = cluster_utils.compute_cluster_stats(
-                gaussians_xyz,
-                semantic_pred,
-                cluster_ids,
-                num_clusters
-            )
+    # Apply best parameters
+    best_temperature, best_max_dist, best_threshold = best_params
+    print(f"[BO Dense] Best params: temperature={best_temperature:.3f}, "
+          f"max_dist={best_max_dist:.3f}, threshold={best_threshold:.2f}")
 
-            # -----------------------------------------
-            # Build adjacency A between Gaussians × MaskInstances
-            # -----------------------------------------
-            # Use the active/trainable Gaussian subset
+    with torch.no_grad():
+        trained_gs_seg.instance_logits.copy_(best_logits)
+        trained_gs_seg.instance_ids.copy_(ids_fixed)  # keep IDs fixed
 
-            seg_indices = torch.arange(gaussians.get_xyz.shape[0], device=gaussians_xyz.device)
-            
-            # Filter topK_contrib_indices
-            topK_filtered = scene.topK_contrib_indices[seg_indices]  # [N_filtered, num_cameras, K]
+    # Filter coherent Gaussians using optimized threshold
+    trained_gs_seg, mask_filt = cluster_utils.filter_coherent_gaussians(
+        trained_gs_seg, threshold=best_threshold
+    )
 
-            # Now call adjacency with filtered Gaussians
-            A = scene.build_gaussian_instance_adjacency(
-                topK_contrib_indices=topK_filtered,
-                mask_images=scene.mask_instances,
-                num_gaussians=gaussians.get_xyz.shape[0],
-                num_mask_instances=scene.num_mask_instances,
-                device=gaussians.get_xyz.device
-            )
+    return best_params, trained_gs_seg
 
-            # -----------------------------------------
-            # Compute mask-center reliability weights
-            # -----------------------------------------
-            mask_center_weights = cluster_utils.compute_mask_center_weights(
-                A,                                                     # sparse adjacency
-                scene.instance_centroids,                              # [M,3] mask center pts
-                gaussians_xyz                                          # [N,3]
-            )                                                          # returns [N] weights ∈ [0,1]
+# -----------------------------
+# BO Threshold Optimization Only
+# -----------------------------
+def optimize_threshold_only(trained_gs_seg, n_calls=50):
+    """
+    Bayesian Optimization to find the best coherence threshold for
+    already trained/fixed instance assignments.
+    """
 
-            # -----------------------------------------
-            # Merge (spatial + semantic + adjacency + center weights)
-            # Uses the unified merge_clusters() function
-            # -----------------------------------------
-            cluster_ids, _ = cluster_utils.merge_clusters(
-                cluster_centroids=cluster_centroids,
-                cluster_semantics=cluster_semantics,
-                cluster_ids=cluster_ids,
-                merge_distance=merge_distance,
-                merge_semantic_diff=merge_semantic_diff,
-                A=A,                                # adjacency constraint
-                mask_center_weights=mask_center_weights,
-                adjacency_min_overlap=3,
-                center_weight_pow=2.0
-            )
+    space = [Real(0.05, 0.9, name='coherence_threshold')]
+    opt = Optimizer(space, random_state=42)
+    best_score = -float('inf')
+    best_threshold = None
 
-            # -----------------------------------------
-            # Multi-camera consistency
-            # -----------------------------------------
-            cluster_ids = cluster_utils.enforce_multicam_consistency_instance(
-                cluster_ids,
-                xyz=gaussians_xyz,
-                cameras=scene.getTrainCameras(),
-                mask_inst_dir=mask_inst_dir,
-                pixel_tolerance=2.0,
-                min_view_support=3
-            )
+    ids_fixed = trained_gs_seg.instance_ids.detach()
+    xyz = trained_gs_seg.get_xyz.detach()
 
-            # -----------------------------------------
-            # Splitting step (unchanged)
-            # -----------------------------------------
-            cluster_ids, _ = cluster_utils.split_cluster(
-                gaussians_xyz,
-                semantic_pred,
-                cluster_ids,
-                max_dispersion=max_dispersion,
-                max_semantic_std=max_semantic_std
-            )
+    for i in tqdm(range(n_calls), desc="BO Threshold Only"):
+        [coherence_threshold] = opt.ask()
 
-            
-            print(f"[INFO] {len(torch.unique(cluster_ids))} clusters")
+        # Filter the model with the current threshold
+        filtered_model, mask = cluster_utils.filter_coherent_gaussians(
+            trained_gs_seg, threshold=coherence_threshold
+        )
 
-    print("[OK] Dynamic cluster training completed.")
-    return gaussians_xyz.detach(), gaussians.semantic_mask.detach(), cluster_ids
+        # Skip thresholds that remove all Gaussians
+        if filtered_model.get_xyz.shape[0] == 0:
+            opt.tell([coherence_threshold], 1e6)  # very bad score
+            continue
 
+        # Compute spatial coherence score on filtered model
+        filtered_logits = filtered_model.instance_logits.detach()
+        filtered_ids = filtered_model.instance_ids.detach()
+        filtered_xyz = filtered_model.get_xyz.detach()
 
-# # ---------------------------------
-# # Cluster Assignment training loop
-# # ---------------------------------
-# def assign_clusters_dynamic(scene, colmap_seed_gaussians, trained_gs_seg, mask_inst_dir,
-#                             merge_distance=0.05, merge_semantic_diff=0.01,
-#                             max_dispersion=0.05, max_semantic_std=0.1):
-#     """
-#     Assign Gaussians to clusters using COLMAP seeds without moving their positions.
-#     Optional semantic-aware merging/splitting is applied to cluster_ids only.
+        score = spatial_coherence_score(filtered_logits, filtered_ids, filtered_xyz)
 
-#     Args:
-#         scene (Scene): Scene object containing Gaussians and cameras
-#         colmap_seed_gaussians (GaussianModel): Seed points from COLMAP reconstruction
-#         trained_gs_seg (GaussianModel): Segmented Gaussian model
-#         mask_inst_dir (str): Path to mask instances for multi-camera consistency
-#         merge_distance (float): Distance threshold for merging clusters
-#         merge_semantic_diff (float): Semantic difference threshold for merging
-#         max_dispersion (float): Dispersion threshold for splitting clusters
-#         max_semantic_std (float): Semantic std threshold for splitting clusters
+        # maximize the score
+        opt.tell([coherence_threshold], -score)
 
-#     Returns:
-#         cluster_ids (Tensor[N]): cluster assignment per Gaussian
-#     """
-#     gaussians = trained_gs_seg
-#     device = gaussians.get_xyz.device
+        if score > best_score:
+            best_score = score
+            best_threshold = coherence_threshold
 
-#     # Detach positions to prevent any accidental updates
-#     xyz = gaussians.get_xyz.detach()
-#     semantic_mask = torch.sigmoid(gaussians.semantic_mask.detach().squeeze())
+    print(f"[BO Threshold Only] Best threshold: {best_threshold:.3f}")
 
-#     # Initial assignment: nearest COLMAP seed per Gaussian
-#     seed_xyz = colmap_seed_gaussians.get_xyz.detach()
-#     dists = torch.cdist(xyz, seed_xyz)  # [N, K]
-#     cluster_ids = torch.argmin(dists, dim=1)  # [N]
+    # Apply best threshold to the actual model
+    trained_gs_seg, _ = cluster_utils.filter_coherent_gaussians(
+        trained_gs_seg, threshold=best_threshold
+    )
 
-#     # Compute initial cluster stats
-#     cluster_centroids, cluster_semantics, cluster_sizes = cluster_utils.compute_cluster_stats(
-#         xyz, semantic_mask, cluster_ids, seed_xyz.shape[0]
-#     )
-
-#     # Step 1: spatial + semantic merging
-#     cluster_ids, _ = cluster_utils.merge_clusters(
-#         cluster_centroids,
-#         cluster_semantics,
-#         cluster_ids,
-#         merge_distance=merge_distance,
-#         merge_semantic_diff=merge_semantic_diff
-#     )
-
-#     # Step 2: multi-camera consistency
-#     cluster_ids = cluster_utils.enforce_multicam_consistency_instance(
-#         cluster_ids,
-#         xyz=xyz,
-#         cameras=scene.getTrainCameras(),
-#         mask_inst_dir=mask_inst_dir,
-#         pixel_tolerance=2.0,
-#         min_view_support=3
-#     )
-
-#     # Step 3: optional re-split over-merged clusters
-#     cluster_ids, _ = cluster_utils.split_cluster(
-#         xyz,
-#         semantic_mask,
-#         cluster_ids,
-#         max_dispersion=max_dispersion,
-#         max_semantic_std=max_semantic_std
-#     )
-
-#     n_clusters = int(cluster_ids.unique().numel())
-#     print(f"[OK] Cluster assignment completed. Total clusters: {n_clusters}")
-#     return cluster_ids
+    return best_threshold, trained_gs_seg
 
 
 
 # -----------------------------
-# Main execution
+# Main
 # -----------------------------
 def main():
 
@@ -413,40 +353,201 @@ def main():
     mask_inst_dir = "/home/samuelemara/Grounded-SAM-2-autodistill/samuele/Lemon_only/mask_instances"
     ply_path = os.path.join(model_dir, "point_cloud/iteration_30000/point_cloud.ply")
     out_ply_path = os.path.join(model_dir, "point_cloud/iteration_30000/scene_clusters.ply")
+    filtered_ply_path = os.path.join(model_dir, "point_cloud/iteration_30000/filtered_scene_clusters.ply")
 
-    # Load the tained model and the COLMAP points as seeds: [num_seeds, 3] tensor
-    scene, dataset, colmap_seed,trained_gs_seg = initialize_scene(colmap_dir, model_dir, mask_inst_dir, load_iteration=-1)
-    
-    topK_contrib = compute_topK_contributors(scene, K=8)
+    # ----------------------------------------------------
+    # Load scene + full model + segmented model
+    # ----------------------------------------------------
+    start_total = time.time()
+    print(f"[DEBUG] Starting Filter at {time.strftime('%H:%M:%S')}")
 
-    # Assign to the Scene so training code can access it
-    scene.topK_contrib_indices = topK_contrib["indices"]
-    scene.topK_contrib_opacities = topK_contrib["opacities"]
+    # Number of BO optimization steps
+    num_its_BO=100
 
-    xyz_final, sem_final, cluster_ids = train_clusters_dynamic(
-        scene,
-        colmap_seed,
-        trained_gs_seg,
-        topK_contrib,
+    scene, dataset, colmap_seed, trained_gs_seg, scene_info = initialize_scene(
+        colmap_dir,
+        model_dir,
         mask_inst_dir,
-        iterations=500,
-        lr=5e-4,
-        alpha=10.0,
-        semantic_scale=1.0,
-        radius=0.05
+        load_iteration=-1,
+        num_its_BO=num_its_BO
     )
-    # Update the Gaussian model tensors with final results
-    with torch.no_grad():
-        trained_gs_seg._xyz.copy_(xyz_final)
-        trained_gs_seg.semantic_mask.copy_(sem_final)
 
-    # cluster_ids = assign_clusters_dynamic(scene, colmap_seed, trained_gs_seg, mask_inst_dir)
+    full_model = scene.gaussians  # the original trained full-resolution GS model
+    t0 = time.time()
+    print(f"[TIME] Scene initialized, took {time.time() - t0:.2f}s")
 
-    # Save clustered PLY from the segmented/trained Gaussians
-    trained_gs_seg.save_clustered_ply(out_ply_path, cluster_ids=cluster_ids)
+    # ----------------------------------------------------
+    # Compute Top-K per full-model Gaussian
+    # ----------------------------------------------------
+    print("\n[Step] Computing top-K contributors on full model ...")
+    t0 = time.time()
+    topK_full = cluster_utils.compute_topK_contributors(scene, K=8)
 
-    # Visualize the clustered pointcloud
-    visualize_clusters_from_ply(out_ply_path)
+    print(f"[TIME] Compute Top-K contributors, took {time.time() - t0:.2f}s")
+    # Check how many Gaussians actually contribute at least once
+    contrib_count = (topK_full['indices'] >= 0).sum(dim=(1,2))
+    
+    # ----------------------------------------------------
+    # Build mapping full → segmented
+    # ----------------------------------------------------
+    print("\n[Step] Computing full->seg mapping...")
+    t0 = time.time()
+    full_to_seg, kept_full = cluster_utils.compute_full_to_seg_map(trained_gs_seg, full_model)
+    print(f"[TIME] Computed full->seg mapping, took {time.time() - t0:.2f}s")
+
+    # ----------------------------------------------------
+    # Convert full-model topK → segmented topK
+    # ----------------------------------------------------
+    print("\n[Step] Mapping top-K to segmented model...")
+    t0 = time.time()
+    topK_seg = cluster_utils.map_full_topK_to_segmented(topK_full, full_to_seg, kept_full)
+    print(f"[TIME] Computed mapping top-K, took {time.time() - t0:.2f}s")
+    # Check how many segmented Gaussians have contributions
+    seg_contrib_count = (topK_seg['indices'] >= 0).sum(dim=(1,2))
+
+    # ----------------------------------------------------
+    # Convert top-K to responsibilities
+    # ----------------------------------------------------
+    print("\n[Step] Computing responsibilities...")
+    t0 = time.time()
+    r_point_idx, r_gauss_idx, r_vals = cluster_utils.topK_to_responsibilities(topK_seg)
+    print(f"[TIME] Computed responsibilities, took {time.time() - t0:.2f}s")
+
+    print("\n[Step] Visualizing clusters from COLMAP...")
+    visualize_colmap_clusters(scene_info,scene)
+    
+    # print(f"[DEBUG] topK_full['indices'] shape={topK_full['indices'].shape}, "
+    #     f"min={topK_full['indices'].min().item()}, max={topK_full['indices'].max().item()}")
+    # print(f"[DEBUG] topK_full['opacities'] shape={topK_full['opacities'].shape}, "
+    #     f"min={topK_full['opacities'].min().item()}, max={topK_full['opacities'].max().item()}")
+    # print(f"[DEBUG] Number of Gaussians with ≥1 contribution: {int((contrib_count>0).sum().item())} / {topK_full['indices'].shape[0]}")
+
+    # print(f"[DEBUG] kept_full.shape={kept_full.shape}, full_to_seg.shape={full_to_seg.shape}")
+    # print(f"[DEBUG] full_to_seg min={full_to_seg.min().item()}, max={full_to_seg.max().item()}")
+
+    # print(f"[DEBUG] topK_seg['indices'] shape={topK_seg['indices'].shape}, "
+    #     f"min={topK_seg['indices'].min().item()}, max={topK_seg['indices'].max().item()}")
+    # print(f"[DEBUG] topK_seg['opacities'] shape={topK_seg['opacities'].shape}, "
+    #     f"min={topK_seg['opacities'].min().item()}, max={topK_seg['opacities'].max().item()}")
+    # print(f"[DEBUG] Segmented Gaussians with ≥1 contribution: {int((seg_contrib_count>0).sum().item())} / {topK_seg['indices'].shape[0]}")
+    # print(f"[DEBUG] r_point_idx.shape={r_point_idx.shape}, r_gauss_idx.shape={r_gauss_idx.shape}, r_vals.shape={r_vals.shape}")
+    # print(f"[DEBUG] r_point_idx min={r_point_idx.min().item() if r_point_idx.numel()>0 else -1}, "
+    #     f"max={r_point_idx.max().item() if r_point_idx.numel()>0 else -1}")
+    # print(f"[DEBUG] r_gauss_idx min={r_gauss_idx.min().item() if r_gauss_idx.numel()>0 else -1}, "
+    #     f"max={r_gauss_idx.max().item() if r_gauss_idx.numel()>0 else -1}")
+    # print(f"[DEBUG] r_vals min={r_vals.min().item() if r_vals.numel()>0 else -1}, max={r_vals.max().item() if r_vals.numel()>0 else -1}")
+
+
+    # # ----------------------------------------------------
+    # # Train clustering using dynamic instance refinement
+    # # ----------------------------------------------------
+    # print("\n[Step] Training instance clusters...")
+    # xyz_final, logits_final, ids_final = train_clusters_dynamic_instance(
+    #     scene,
+    #     trained_gs_seg,
+    #     colmap_seed,
+    #     r_point_idx,
+    #     r_gauss_idx,
+    #     r_vals,
+    #     iterations=100,
+    #     lr=5e-4,
+    #     temperature=0.1,
+    #     max_dist=0.05,
+    #     debug=True
+    # )
+    # # print(f"[DEBUG] Final xyz shape={xyz_final.shape}, logits shape={logits_final.shape}, ids shape={ids_final.shape}")
+
+    # # ----------------------------------------------------
+    # # Save results
+    # # ----------------------------------------------------
+    # print("\n[Step] Saving updated Gaussian instance fields...")
+    # with torch.no_grad():
+    #     trained_gs_seg.instance_logits.copy_(logits_final)
+    #     trained_gs_seg.instance_ids.copy_(ids_final)
+
+    # # Save the full clustered PLY
+    # trained_gs_seg.save_clustered_ply(out_ply_path, cluster_ids=ids_final)
+
+    # print("\n[Step] Visualizing clusters from PLY...")
+    # visualize_clusters_from_ply(out_ply_path)
+
+
+    # # ------------------------------------------------------------------
+    # # FILTERING BASED ON COHERENCE
+    # # ------------------------------------------------------------------
+    # TH = 0.40
+    # print(f"\n[Step] Filtering gaussians with coherence > {TH} ...")
+
+    # trained_gs_seg, mask_filt = cluster_utils.filter_coherent_gaussians(trained_gs_seg, threshold=TH)
+    
+    # # ------------------------------------------------------------------
+    # # SAVE FILTERED PLY USING segmented_gaussians DIRECTLY
+    # # ------------------------------------------------------------------
+    # print(f"\n[Step] Saving filtered PLY to: {filtered_ply_path}")
+
+    # trained_gs_seg.save_clustered_ply(filtered_ply_path, cluster_ids=trained_gs_seg.instance_ids)
+
+    # print("\n[Step] Visualizing FILTERED PLY...")
+    # visualize_clusters_from_ply(filtered_ply_path)
+    # ----------------------------------------------------
+
+     # ----------------------------------------------------
+    # Train clustering using dynamic instance refinement
+    # ----------------------------------------------------
+    lr = 5e-4
+    print("\n[Step] Training instance clusters...")
+    xyz_final, logits_final, ids_final = train_clusters_dynamic_instance(
+        scene,
+        trained_gs_seg,
+        colmap_seed,
+        r_point_idx,
+        r_gauss_idx,
+        r_vals,
+        iterations=100,
+        lr=lr,
+        temperature=0.1,
+        max_dist=0.05,
+        debug=True
+    )
+
+    # # ----------------------------------------------------
+    # # Run BO Dense Instance Cluster Optimization
+    # # ----------------------------------------------------
+    # print("\n[Step] Running Bayesian Optimization on dense instance clusters...")
+    # best_params, trained_gs_seg = optimize_dense_instances(
+    #     scene,
+    #     trained_gs_seg,
+    #     colmap_seed,
+    #     r_point_idx,
+    #     r_gauss_idx,
+    #     r_vals,
+    #     n_calls=num_its_BO,
+    #     iterations=100,
+    #     lr=lr
+    # )
+
+    # ----------------------------------------------------
+    # Optimize coherence threshold only
+    # ----------------------------------------------------
+    print("\n[Step] Running Bayesian Optimization to find best threshold...")
+    best_threshold, trained_gs_seg = optimize_threshold_only(
+        trained_gs_seg,
+        n_calls=num_its_BO
+    )
+
+    # ----------------------------------------------------
+    # Save filtered PLY
+    # ----------------------------------------------------
+    print(f"\n[Step] Saving filtered PLY to: {filtered_ply_path}")
+    trained_gs_seg.save_clustered_ply(filtered_ply_path, cluster_ids=trained_gs_seg.instance_ids)
+
+    print("\n[Step] Visualizing FILTERED PLY...")
+    visualize_clusters_from_ply(filtered_ply_path)
+
+    runtime = time.time() - start_total
+    print(f"[TIME] Filter finished at {time.strftime('%H:%M:%S')}, total runtime: {runtime:.2f}s")
+
+
 
 if __name__ == "__main__":
     main()

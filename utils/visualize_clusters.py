@@ -1,6 +1,8 @@
 import open3d as o3d
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import torch
 from plyfile import PlyData
 
 def visualize_clusters_from_ply(ply_path):
@@ -50,3 +52,87 @@ def visualize_clusters_from_ply(ply_path):
     # -------------------------
     o3d.visualization.draw_geometries([pcd])
 
+def visualize_colmap_clusters(scene_info, scene, title="COLMAP Seed Clusters"):
+    """
+    Visualize COLMAP 3D points colored by cluster ID.
+    Only COLMAP points, no Gaussians overlay.
+
+    Inputs:
+        scene_info: contains COLMAP point cloud info
+        scene: Scene object containing `point_clusters` dict
+    """
+
+    # -------------------------------------
+    # 1. Build arrays from point_clusters
+    # -------------------------------------
+    colmap_points_list = []
+    colmap_cids_list = []
+
+    # print(scene.points3D)
+
+    unassigned = 0
+    for pid, cid in scene.point_clusters.items():
+        if pid in scene.points3D:
+            # Extract xyz coordinates properly
+            pt3d = scene.points3D[pid]
+           
+            try:
+                pt = np.array(pt3d.xyz)
+            except AttributeError:
+                pt = np.array(pt3d[:3])
+
+            colmap_points_list.append(pt)
+            colmap_cids_list.append(cid)
+        else:
+            unassigned += 1
+
+    if unassigned > 0:
+        print(f"[DEBUG] {unassigned} points skipped (not found in points3D)")
+
+    colmap_points = np.stack(colmap_points_list, axis=0)  # [Nc, 3]
+    colmap_cids   = np.array(colmap_cids_list)            # [Nc]
+
+    # -----------------------------
+    # 2. Inspect clusters
+    # -----------------------------
+    unique_cids, counts = np.unique(colmap_cids, return_counts=True)
+    # print(f"[DEBUG] Total points: {len(colmap_cids)}, unique clusters: {len(unique_cids)}")
+    # for cid, cnt in zip(unique_cids, counts):
+    #     print(f"  Cluster {cid}: {cnt} points")
+
+    # -----------------------------
+    # 3. Build unlimited color palette
+    # -----------------------------
+    K = len(unique_cids)
+    base_maps = [plt.cm.get_cmap("tab20"), plt.cm.get_cmap("tab20b"), plt.cm.get_cmap("tab20c")]
+    palette = []
+    for cmap in base_maps:
+        palette.extend([cmap(i) for i in range(cmap.N)])
+    colors = [palette[i % len(palette)] for i in range(K)]
+
+    # -----------------------------
+    # 4. Plot
+    # -----------------------------
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    for idx, cid in enumerate(unique_cids):
+        mask = colmap_cids == cid
+        cluster_pts = colmap_points[mask]
+        ax.scatter(
+            cluster_pts[:, 0],
+            cluster_pts[:, 1],
+            cluster_pts[:, 2],
+            s=45,
+            color=colors[idx],
+            alpha=0.95,
+            label=f"Cluster {cid}",
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.legend(loc="upper right", fontsize=8)
+    plt.tight_layout()
+    plt.show()

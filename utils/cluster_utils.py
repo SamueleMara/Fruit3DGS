@@ -3,551 +3,593 @@ import glob
 import torch
 import numpy as np
 from PIL import Image
+from pathlib import Path
+from collections import defaultdict
+
+from tqdm import tqdm
+from scene.gaussian_model import GaussianModel
+from gaussian_renderer import render
 
 import torch.nn.functional as F
+import torch.nn as nn
+
+from sklearn.neighbors import NearestNeighbors
+from math import log, sqrt
+
 
 # -----------------------------
-# Initialize clusters from COLMAP points (with known cluster mapping)
+# Debug helper
 # -----------------------------
-def initialize_clusters_from_colmap(gaussians_xyz, colmap_points, colmap_cluster_ids, batch_size=20000):
+def debug_tensor(name, tensor):
     """
-    Assign each Gaussian to one of the known clusters derived from COLMAP points,
-    WITHOUT moving the Gaussian positions.
+    Print detailed debug info about a tensor.
 
-    Args:
-        gaussians_xyz:      [N, 3] tensor of Gaussian centers (on GPU)
-        colmap_points:      [M, 3] tensor of COLMAP seed centers (on GPU)
-        colmap_cluster_ids: [M] LongTensor giving known cluster ID (e.g., 0, 1, 2) for each COLMAP point
-        batch_size:         number of Gaussians processed per batch to avoid OOM
+    Inputs:
+        name: str        Name of the tensor
+        tensor: torch.Tensor or None
+    Outputs:
+        Prints shape, dtype, device, min, max (or None)
+    """
+    if tensor is None:
+        print(f"[DEBUG] {name}: None")
+    else:
+        print(
+            f"[DEBUG] {name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"device={tensor.device}, min={tensor.min().item()}, max={tensor.max().item()}"
+        )
+
+# -----------------------------
+# Initialize Gaussian Instances (COLMAP seeds -> gaussians)
+# -----------------------------
+def initialize_gaussian_instances(gaussians, colmap_points, colmap_cluster_ids, temperature=0.1, max_dist=0.05):
+    """
+    Initialize Gaussian instance logits from COLMAP cluster seeds.
+
+    Inputs:
+        gaussians: GaussianModel (segmented)
+        colmap_points: FloatTensor [Nc,3] COLMAP points
+        colmap_cluster_ids: LongTensor [Nc] Cluster IDs
+        temperature: float Softmax temperature
+        max_dist: float Distance threshold for hard assignment
+
+    Outputs:
+        Updates gaussians.instance_logits [N_seg, G] and instance_ids [N_seg]
+    """
+
+    # Move everything to the same device as the Gaussian model
+    device = gaussians.get_xyz.device
+    xyz = gaussians.get_xyz.to(device)
+    colmap_points = colmap_points.to(device)
+    colmap_cluster_ids = colmap_cluster_ids.to(device)
+
+    # Map COLMAP cluster IDs to a contiguous range [0, G-1]
+    unique_ids = torch.unique(colmap_cluster_ids)  # unique cluster IDs
+    G = unique_ids.numel()                          # number of clusters
+    id_map = torch.full((int(colmap_cluster_ids.max().item()) + 1,), -1, dtype=torch.long, device=device)
+    id_map[unique_ids] = torch.arange(G, device=device)
+    colmap_cluster_ids = id_map[colmap_cluster_ids]  # remap cluster IDs
+
+    # Prepare instance fields in the Gaussian model
+    N = xyz.shape[0]  # number of Gaussians
+    gaussians.set_instance_fields(N, G, device)
+
+    # Compute pairwise distances between Gaussians and COLMAP points
+    d = torch.cdist(xyz, colmap_points)  # shape [N, Nc]
+    min_d, min_idx = d.min(dim=1)        # distance and index of closest COLMAP point for each Gaussian
+    closest_cluster = colmap_cluster_ids[min_idx]  # cluster ID of closest point
+
+    # Initialize logits for instance assignments
+    logits = torch.zeros((N, G), device=device)
+
+    # Hard assignment: assign fully to closest cluster if within max_dist
+    mask = min_d <= max_dist
+    logits[mask, closest_cluster[mask]] = 1.0
+
+    # Soft/uniform assignment for Gaussians too far from any COLMAP point
+    logits[~mask] = 1.0 / float(G)
+
+    # Apply temperature-scaled softmax to get probability distribution over instances
+    gaussians.instance_logits = torch.nn.Parameter(torch.softmax(logits / temperature, dim=1))
+
+    # Hard assignment of each Gaussian to the cluster with highest probability
+    gaussians.instance_ids = torch.argmax(gaussians.instance_logits, dim=1).detach()
+
+
+def compute_topK_contributors(scene, K=8, bg_color=(0, 0, 0)):
+    """
+    Fast version: Computes the top-K contributing pixels for each Gaussian
+    across all training cameras. No sorting, no Python Gaussian loops.
+
+    Outputs:
+        indices:   [N, C, K]  pixel indices (or -1)
+        opacities: [N, C, K]  contribution weights (1.0)
+    """
+    
+
+    # ----------------------------------------
+    # Prepare scene / buffers
+    # ----------------------------------------
+    gaussians = scene.gaussians
+    N = gaussians.get_xyz.shape[0]
+    cameras = scene.getTrainCameras()
+    C = len(cameras)
+    device = gaussians.get_xyz.device
+
+    topK_indices = -torch.ones((N, C, K), dtype=torch.long, device=device)
+    topK_opacities = torch.zeros((N, C, K), dtype=torch.float32, device=device)
+
+    # insertion counters per camera
+    # insert_pos[camera][gaussian] = next free slot [0..K]
+    insert_pos = torch.zeros((C, N), dtype=torch.long, device=device)
+
+    # Dummy render pipe
+    class _DummyPipe:
+        debug = False
+        antialiasing = False
+        compute_cov3D_python = False
+        convert_SHs_python = False
+
+    dummy_pipe = _DummyPipe()
+    bg_col = torch.tensor(bg_color, dtype=torch.float32, device=device)
+
+    # ----------------------------------------
+    # Process each camera
+    # ----------------------------------------
+    for cam_idx, cam in enumerate(tqdm(cameras, desc="Computing top-K contributors")):
+        with torch.no_grad():
+            out = render(cam, gaussians, dummy_pipe, bg_col, contrib=True, K=K)
+
+        if out is None or ("contrib_indices" not in out) or (out["contrib_indices"] is None):
+            continue
+
+        contrib = out["contrib_indices"]      # [H, W, K]
+        H, W, _ = contrib.shape
+
+        flat = contrib.view(-1, K)
+        valid_mask = flat >= 0
+
+        gauss_ids = flat[valid_mask].long()         # <-- FIX HERE
+        pixel_ids = valid_mask.nonzero(as_tuple=True)[0]
+        # Example:
+        # flat:
+        #     pixel 0: [ 4, -1, -1 ]
+        #     pixel 1: [ 4,  7, -1 ]
+        #
+        # valid_mask:
+        #     pixel 0: [1,0,0]
+        #     pixel 1: [1,1,0]
+
+        # ----------------------------------------
+        # Assign pixel → Gaussian Top-K
+        # ----------------------------------------
+        # insertion position per Gaussian for this camera
+        cam_insert = insert_pos[cam_idx]                  # [N]
+
+        # positions where this Gaussian will be inserted
+        pos = cam_insert[gauss_ids]                       # [M]
+
+        # Only keep contributions where Gaussian has room (< K)
+        keep = pos < K
+        if not keep.any():
+            continue
+
+        gid = gauss_ids[keep]         # Gaussian ids to write
+        pid = pixel_ids[keep]         # Pixel indices to write
+        ppos = pos[keep].clamp(max=K-1)
+
+        # Scatter into output tensors
+        topK_indices[gid, cam_idx, ppos] = pid
+        topK_opacities[gid, cam_idx, ppos] = 1.0
+
+        # Advance counters
+        cam_insert[gid] += keep.sum(dim=0) * 0  # only increase selected ones
+        cam_insert[gid] = (cam_insert[gid] + 1).clamp(max=K)
+
+        # Store back
+        insert_pos[cam_idx] = cam_insert
+
+    return {
+        "indices": topK_indices,
+        "opacities": topK_opacities,
+    }
+
+
+# -----------------------------
+# Convert to pixel-centric responsibilities (vectorized)
+# -----------------------------
+def topK_to_responsibilities(topK_contrib):
+    """
+    Converts top-K contributors (Gaussian->pixels) -> pixel-centric format:
+    r_point_idx, r_gauss_idx, r_vals (all tensors)
+    """
+    indices, opac = topK_contrib["indices"], topK_contrib["opacities"]
+    device = indices.device
+
+    N_gauss, C, K = indices.shape
+    gauss_idx = torch.arange(N_gauss, device=device)[:, None, None].expand(-1, C, K)
+    
+    # Flatten
+    flat_idx = indices.reshape(-1)
+    flat_op = opac.reshape(-1)
+    flat_gauss = gauss_idx.reshape(-1)
+
+    # Keep only valid pixel indices
+    mask = flat_idx >= 0
+    if mask.sum() == 0:
+        return (torch.empty(0, dtype=torch.long, device=device),
+                torch.empty(0, dtype=torch.long, device=device),
+                torch.empty(0, dtype=torch.float32, device=device))
+
+    r_point_idx = flat_idx[mask]
+    r_gauss_idx = flat_gauss[mask]
+    r_vals = flat_op[mask]
+
+    # Normalize per pixel using scatter_add
+    uniq_pts, inv = torch.unique(r_point_idx, return_inverse=True)
+    denom = torch.zeros_like(uniq_pts, dtype=r_vals.dtype, device=device)
+    denom.scatter_add_(0, inv, r_vals)
+    r_vals = r_vals / torch.clamp(denom[inv], min=1e-12)
+
+    return r_point_idx, r_gauss_idx, r_vals
+
+
+# -----------------------------
+# Compute full -> segmented Gaussian mapping (vectorized if possible)
+# -----------------------------
+def compute_full_to_seg_map(trained_gs_seg, full_model):
+    """
+    Map full-resolution Gaussian indices -> segmented Gaussian indices.
+    """
+    device = full_model.get_xyz.device
+    N_full, N_seg = full_model.get_xyz.shape[0], trained_gs_seg.get_xyz.shape[0]
+
+    # If attribute exists, use it directly
+    if hasattr(trained_gs_seg, "full_res_indices") and trained_gs_seg.full_res_indices is not None:
+        kept_full = trained_gs_seg.full_res_indices.to(device).long()
+        method = "attribute: full_res_indices"
+    else:
+        method = "fallback_nn_positions"
+        full_xyz, seg_xyz = full_model.get_xyz.to(device), trained_gs_seg.get_xyz.to(device)
+        batch = 8192
+        ids = []
+        for start in range(0, N_seg, batch):
+            end = min(start + batch, N_seg)
+            d = torch.cdist(seg_xyz[start:end], full_xyz)
+            idx = d.argmin(dim=1)
+            ids.append(idx)
+        kept_full = torch.cat(ids).long()
+
+    if (kept_full < 0).any() or (kept_full >= N_full).any():
+        raise RuntimeError("kept_full contains invalid indices")
+
+    # Map full -> segmented
+    full_to_seg = torch.full((N_full,), -1, dtype=torch.long, device=device)
+    full_to_seg[kept_full] = torch.arange(kept_full.numel(), device=device)
+
+    print(f"[map] full_model N={N_full}, segmented N={N_seg}, method={method}")
+    print(f"[map] mapped kept_full count = {kept_full.numel()}, mapped full->seg hits = {(full_to_seg>=0).sum().item()}")
+    return full_to_seg, kept_full
+
+
+# -----------------------------
+# Map full Top-K -> segmented Top-K (vectorized)
+# -----------------------------
+def map_full_topK_to_segmented(topK_full, full_to_seg, kept_full):
+    """
+    Map full-resolution top-K Gaussian contributors -> segmented top-K
+    """
+    device = topK_full["indices"].device
+    topK_indices_full = topK_full["indices"][kept_full]      # [N_seg, C, K]
+    topK_opac_full = topK_full["opacities"][kept_full]      # [N_seg, C, K]
+
+    # Map indices to segmented
+    mapped_indices = topK_indices_full.clone()
+    valid_mask = (mapped_indices >= 0) & (mapped_indices < full_to_seg.numel())
+    mapped_indices[valid_mask] = full_to_seg[mapped_indices[valid_mask]]
+    mapped_indices[~valid_mask] = -1
+
+    # Zero out invalid opacities
+    topK_opac_full[mapped_indices < 0] = 0.0
+
+    # Debug
+    # print(f"[DEBUG] topK_seg['indices'] min={mapped_indices.min().item()}, max={mapped_indices.max().item()}")
+    # print(f"[DEBUG] topK_seg['opacities'] min={topK_opac_full.min().item()}, max={topK_opac_full.max().item()}")
+    valid_contribs = (mapped_indices >= 0).sum().item()
+    # print(f"[DEBUG] Segmented Gaussians with ≥1 contribution: {valid_contribs} / {kept_full.numel()}")
+
+    return {"indices": mapped_indices, "opacities": topK_opac_full}
+
+
+# -----------------------------
+# Convert Gaussians -> pixels (vectorized version)
+# -----------------------------
+def convert_gauss_to_pixel_map(topK_full):
+    """
+    Convert Gaussian->pixel top-K map to pixel->Gaussian mapping (vectorized).
+    """
+    indices = topK_full["indices"]
+    opacities = topK_full["opacities"]
+    device = indices.device
+    N_gauss, C, K = indices.shape
+
+    # Flatten
+    flat_idx = indices.reshape(-1)
+    flat_gauss = torch.arange(N_gauss, device=device)[:, None, None].expand(-1, C, K).reshape(-1)
+    flat_op = opacities.reshape(-1)
+
+    # Filter valid contributions
+    mask = (flat_idx >= 0) & (flat_op > 0)
+    flat_idx, flat_gauss = flat_idx[mask], flat_gauss[mask]
+
+    # Build dictionary: pixel -> list of gaussians
+    pixel_to_gauss = {}
+    for pix, g in zip(flat_idx.tolist(), flat_gauss.tolist()):
+        pixel_to_gauss.setdefault(pix, []).append(g)
+
+    # Flatten to list of tuples (tensor of gaussians, mask_val=1.0)
+    mappings = [(torch.tensor(glist, dtype=torch.long, device=device), 1.0)
+                for glist in pixel_to_gauss.values()]
+
+    print(f"[INFO] Converted {len(mappings)} pixels → Gaussians")
+    return mappings
+
+
+# -----------------------------
+# Compute instance coherence
+# -----------------------------
+def compute_instance_coherence(logits, ids):
+    """
+    logits: [N, C] tensor of per-Gaussian instance logits
+    ids:    [N] tensor of final instance IDs
 
     Returns:
-        cluster_ids:        [N] LongTensor (nearest COLMAP cluster for each Gaussian)
-        cluster_centroids:  [K, 3] Tensor (mean position of COLMAP points in each cluster)
+        coherence: [N] tensor of per-Gaussian coherence scores
     """
-    device = gaussians_xyz.device
-    dtype = gaussians_xyz.dtype
+    probs = torch.softmax(logits, dim=1)
+    coherence = probs[torch.arange(len(ids)), ids]
+    return coherence
 
-    colmap_points = colmap_points.to(device=device, dtype=dtype)
-    colmap_cluster_ids = colmap_cluster_ids.to(device=device)
-
-    # Compute cluster centroids (for assignment only)
-    unique_clusters = torch.unique(colmap_cluster_ids, sorted=True)
-    cluster_centroids = torch.stack([
-        colmap_points[colmap_cluster_ids == cid].mean(dim=0)
-        for cid in unique_clusters
-    ], dim=0)  # [K, 3]
-
-    N = gaussians_xyz.shape[0]
-    cluster_ids = torch.empty(N, dtype=torch.long, device=device)
-
-    # Assign each Gaussian to nearest COLMAP cluster centroid
-    for start in range(0, N, batch_size):
-        end = min(start + batch_size, N)
-        batch = gaussians_xyz[start:end]  # keep original geometry
-        dist = torch.cdist(batch, cluster_centroids, p=2)
-        cluster_ids[start:end] = torch.argmin(dist, dim=1)
-
-    return cluster_ids, cluster_centroids
 
 # -----------------------------
-# Update cluster centroids and semantic averages
+# Filter Coherent Gaussians
 # -----------------------------
-def compute_cluster_stats(gaussians_xyz, gaussians_sem, cluster_ids, num_clusters):
-    cluster_centroids = []
-    cluster_semantics = []
-    cluster_sizes = []
-    
-    for cid in range(num_clusters):
-        mask = cluster_ids == cid
-        if mask.sum() == 0:
-            cluster_centroids.append(torch.zeros(3, device=gaussians_xyz.device))
-            cluster_semantics.append(torch.tensor(0.0, device=gaussians_sem.device))
-            cluster_sizes.append(torch.tensor(0, device=gaussians_xyz.device))
+
+def filter_coherent_gaussians(gaussian_model, threshold=0.6):
+    """
+    Filter a GaussianModel by instance coherence.
+
+    Inputs:
+        gaussian_model: GaussianModel instance (segmented)
+        threshold: float, coherence threshold (0.6 by default)
+
+    Returns:
+        filtered_gaussian_model: new GaussianModel containing only coherent Gaussians
+        mask: boolean mask of kept Gaussians
+    """
+    # Retrieve data from the model
+    xyz = gaussian_model.get_xyz
+    logits = gaussian_model.instance_logits
+    ids = gaussian_model.instance_ids
+
+    # Compute coherence
+    coherence = compute_instance_coherence(logits, ids)
+
+    # --- DEBUG: Inspect coherence distribution ---
+    # print("[DEBUG] Coherence stats:",
+    #       f"min={coherence.min().detach().item():.4f}, "
+    #       f"max={coherence.max().detach().item():.4f}, "
+    #       f"mean={coherence.mean().detach().item():.4f}, "
+    #       f"median={coherence.median().detach().item():.4f}")
+
+    mask = coherence >= threshold
+    kept_count = mask.sum().item()
+    total_count = xyz.shape[0]
+    # print(f"[INFO] Keeping {kept_count} / {total_count} coherent Gaussians (TH={threshold})")
+
+    # Create new GaussianModel with filtered attributes
+    filtered_gs = GaussianModel(sh_degree=gaussian_model.active_sh_degree)
+    filtered_gs._xyz = nn.Parameter(xyz[mask].clone().detach())
+    filtered_gs._features_dc = nn.Parameter(gaussian_model._features_dc[mask].clone().detach())
+    filtered_gs._features_rest = nn.Parameter(gaussian_model._features_rest[mask].clone().detach())
+    filtered_gs._scaling = nn.Parameter(gaussian_model._scaling[mask].clone().detach())
+    filtered_gs._rotation = nn.Parameter(gaussian_model._rotation[mask].clone().detach())
+    filtered_gs._opacity = nn.Parameter(gaussian_model._opacity[mask].clone().detach())
+    filtered_gs.semantic_mask = nn.Parameter(gaussian_model.semantic_mask[mask].clone().detach()) if gaussian_model.semantic_mask is not None else None
+
+    # Copy instance info
+    filtered_gs.instance_logits = nn.Parameter(logits[mask].clone().detach())
+    filtered_gs.instance_ids = ids[mask].clone().detach()
+
+    return filtered_gs, mask
+
+
+# -----------------------------
+# Compute Mask Centroids
+# -----------------------------
+
+def compute_mask_centroids(mask_dir):
+    """
+    Compute centroids for all mask instances inside a folder.
+    Accepts ANY image extension (png, jpg, jpeg, bmp, tif, tiff, webp, …)
+
+    Returns:
+        dict: { (frame_name, instance_idx): (cx, cy) }
+    """
+    mask_dir = Path(mask_dir)
+
+    # Allowed extensions
+    exts = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff", "*.webp"]
+
+    # Collect files
+    mask_files = []
+    for ext in exts:
+        mask_files.extend(mask_dir.glob(ext))
+
+    centroids = {}
+
+    for mask_path in mask_files:
+        stem = mask_path.stem
+
+        # Only accept files containing '_instance_X'
+        if "_instance_" not in stem:
             continue
-        cluster_centroids.append(gaussians_xyz[mask].mean(dim=0))
-        cluster_semantics.append(gaussians_sem[mask].mean())
-        cluster_sizes.append(mask.sum())
-    
-    cluster_centroids = torch.stack(cluster_centroids, dim=0)
-    cluster_semantics = torch.stack(cluster_semantics, dim=0)
-    cluster_sizes = torch.tensor(cluster_sizes, device=gaussians_xyz.device)
-    return cluster_centroids, cluster_semantics, cluster_sizes
+
+        try:
+            frame_name, idx_str = stem.rsplit("_instance_", 1)
+            midx = int(idx_str)
+        except:
+            continue
+
+        # Load mask as numpy
+        mask = np.array(Image.open(mask_path).convert("L"))
+        ys, xs = np.where(mask > 128)  # foreground pixels
+
+        if len(xs) == 0:
+            continue
+
+        cx = float(xs.mean())
+        cy = float(ys.mean())
+
+        centroids[(frame_name, midx)] = (cx, cy)
+
+    return centroids
 
 
-# -----------------------------
-# Merge clusters if too close
-# -----------------------------
-def merge_clusters(
-    cluster_centroids,
-    cluster_semantics,
-    cluster_ids,
-    merge_distance=0.05,
-    merge_semantic_diff=0.1,
-    A=None,                     
-    device="cuda"
+
+# --------------------------------------------------------------------
+# Map dt_norm -> dt_real using dt_scale from centroid distances
+# --------------------------------------------------------------------
+def dt_norm_to_real(dt_norm, dt_scale):
+    """
+    Simple linear mapping: dt_norm in [0,1] maps to dt_real in pixels/units.
+    """
+    dt_real = dt_norm * dt_scale
+    return dt_real
+
+# --------------------------------------------------------------------
+# Refine the clusters iteratively with a metrics
+# --------------------------------------------------------------------
+def refine_clusters_with_metric(
+    self,
+    max_iters=5,
+    gather_alpha=0.5,
+    explore_ratio=0.1,
+    w_geom=1.0,
+    w_coh=1.0,
+    w_size=1.0,
+    w_count=0.5,
+    alpha=1.0,
+    spatial_consistency_weight=0.1,
 ):
     """
-    Merge clusters that are spatially close and semantically similar.
-    If A is provided (sparse Gaussians × MaskInstances), clusters that share any mask instance
-    will be force-merged as well.
-
-    Fully preserves original API and return format.
-
-    Args:
-        cluster_centroids: [C, 3]
-        cluster_semantics: [C] or [C, F]
-        cluster_ids: [N]
-        merge_distance: float
-        merge_semantic_diff: float
-        A: optional sparse adjacency matrix [N, M]
-    
-    Returns:
-        updated_cluster_ids: [N]
-        num_clusters: int
+    Refine self.point_clusters maximizing combined score:
+        score = w_geom * geom_term * (coherence ** alpha)
+              + w_size * size_balance
+              + w_count * cluster_count_term
+              + spatial consistency regularization
     """
+    eps = 1e-8
 
-    device = cluster_centroids.device
-    C = cluster_centroids.shape[0]
+    def get_xyz(pid):
+        p = self.points3D[pid]
+        return np.asarray(p.xyz, dtype=np.float32).reshape(-1)[:3]
 
-    if C <= 1:
-        return cluster_ids, C
+    def compute_label_coherence(points3D, clusters_map, k=8):
+        pids = [pid for pid in clusters_map.keys() if clusters_map[pid] != -1]
+        if not pids:
+            return 1.0
+        X = np.vstack([get_xyz(pid) for pid in pids])
+        labels = np.array([clusters_map[pid] for pid in pids], dtype=int)
+        nbrs = NearestNeighbors(n_neighbors=min(k+1, X.shape[0]), algorithm='kd_tree').fit(X)
+        _, indices = nbrs.kneighbors(X)
 
-    # ============================================================
-    # 1) ORIGINAL SPATIAL MERGE LOGIC (unchanged)
-    # ============================================================
+        coherences = []
+        for i, neigh_idx in enumerate(indices):
+            neigh_idx = neigh_idx[1:]
+            same = (labels[neigh_idx] == labels[i])
+            coherences.append(np.mean(same))
+        return float(np.mean(coherences))
 
-    diff = cluster_centroids.unsqueeze(1) - cluster_centroids.unsqueeze(0)
-    dists = torch.norm(diff, dim=2)
+    clusters = dict(self.point_clusters)
+    pids_sorted = sorted(self.points3D.keys())
 
-    if cluster_semantics.ndim == 1:
-        sem_diff = torch.abs(
-            cluster_semantics.unsqueeze(1) - cluster_semantics.unsqueeze(0)
-        )
-    else:
-        sem_diff = torch.norm(
-            cluster_semantics.unsqueeze(1) - cluster_semantics.unsqueeze(0),
-            dim=2
-        )
+    def build_cluster_points_map(clmap):
+        cmap = defaultdict(list)
+        for pid in pids_sorted:
+            cid = clmap.get(pid, -1)
+            if cid != -1:
+                cmap[cid].append(pid)
+        return cmap
 
-    merge_mask = (dists < merge_distance) & (sem_diff < merge_semantic_diff)
-    merge_mask.fill_diagonal_(False)
+    K0 = max(1, len(build_cluster_points_map(clusters)))
 
-    # ============================================================
-    # 2) OPTIONAL MASK-INSTANCE MERGE (vectorized)
-    # ============================================================
-    if A is not None:
-        # A: sparse [N, M] gaussian × mask-instance
-        A = A.coalesce()
-        row = A.indices()[0]        # gaussian id
-        col = A.indices()[1]        # mask instance id
-        M = A.size(1)
+    for iteration in range(max_iters):
+        cluster_points = build_cluster_points_map(clusters)
+        centroids = {cid: np.mean([get_xyz(pid) for pid in pts], axis=0) for cid, pts in cluster_points.items()}
+        cid_list = list(centroids.keys())
 
-        # Map cluster_ids to gaussian rows
-        old_ids_clamped = torch.clamp(cluster_ids, 0, C - 1)
-        gaussian_to_cluster = old_ids_clamped
+        intra_dists = {cid: np.linalg.norm(np.vstack([get_xyz(pid) for pid in pts]) - centroids[cid], axis=1).mean()
+                       for cid, pts in cluster_points.items()}
+        inter_dists = [np.linalg.norm(centroids[cid_list[i]] - centroids[cid_list[j]])
+                       for i in range(len(cid_list)) for j in range(i + 1, len(cid_list))]
 
-        # Build cluster × mask sparse matrix directly
-        # Convert A (N x M) -> cluster_mask (C x M) using scatter
-        cluster_mask = torch.zeros((C, M), dtype=torch.bool, device=device)
-        # For each non-zero gaussian×mask, mark the corresponding cluster
-        cluster_mask.index_put_(
-            (gaussian_to_cluster[row], col), 
-            torch.ones_like(col, dtype=torch.bool, device=device),
-            accumulate=True
-        )
+        mean_intra = float(np.mean(list(intra_dists.values()))) if intra_dists else 0.0
+        mean_inter = float(np.mean(inter_dists)) if inter_dists else 0.0
 
-        # clusters share at least one mask instance?
-        mask_overlap = (cluster_mask.unsqueeze(1) & cluster_mask.unsqueeze(0)).any(dim=2)
+        coherence = compute_label_coherence(self.points3D, clusters, k=8)
 
-        # Add mask-based merging
-        merge_mask |= mask_overlap
-        merge_mask.fill_diagonal_(False)
+        counts = np.array([len(cluster_points[c]) for c in cluster_points.keys()], dtype=np.float32)
+        N = max(1, counts.sum())
+        p = counts / (N + eps)
+        K = max(1, len(p))
+        size_balance = 0.0 if K <= 1 else float(-np.sum(p * np.log(np.where(p > 0, p, 1.0) + eps)) / (np.log(K) + eps))
+        cluster_count_term = float(sqrt(K) / (sqrt(K0) + eps))
 
-    # ============================================================
-    # 3) UNION-FIND (unchanged)
-    # ============================================================
-    parent = torch.arange(C, device=device)
+        geom_term = mean_inter / (mean_intra + eps)
+        geom_with_coh = geom_term * (coherence ** alpha)
+        score = (w_geom * geom_with_coh) + (w_size * size_balance) + (w_count * cluster_count_term)
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
+        # Gathering: merge close centroids
+        thresh = gather_alpha * (mean_inter + eps)
+        merge_candidates = [(cid_list[i], cid_list[j])
+                            for i in range(len(cid_list)) for j in range(i+1, len(cid_list))
+                            if np.linalg.norm(centroids[cid_list[i]] - centroids[cid_list[j]]) < thresh]
+        for a, b in merge_candidates:
+            for pid in cluster_points[b]:
+                clusters[pid] = a
 
-    for i, j in merge_mask.nonzero(as_tuple=False):
-        ri = find(i.item())
-        rj = find(j.item())
-        if ri != rj:
-            parent[rj] = ri
+        # Reassignment with spatial consistency
+        cluster_points = build_cluster_points_map(clusters)
+        centroids = {cid: np.mean([get_xyz(pid) for pid in pts], axis=0) for cid, pts in cluster_points.items()}
+        cid_list = list(centroids.keys())
+        temperature = explore_ratio * (1 - iteration / max_iters)
 
-    # ============================================================
-    # 4) REMAP TO SEQUENTIAL IDS (unchanged)
-    # ============================================================
-    for i in range(C):
-        find(i)
-
-    unique_roots, inverse = torch.unique(parent, return_inverse=True)
-    old_to_new = inverse[parent]
-
-    old_ids_clamped = torch.clamp(cluster_ids, 0, C - 1)
-    updated_cluster_ids = old_to_new[old_ids_clamped]
-
-    return updated_cluster_ids, int(unique_roots.numel())
-
-# -----------------------------
-# Split clusters if too dispersed
-# -----------------------------
-def split_cluster(gaussians_xyz, gaussians_sem, cluster_ids, max_dispersion=0.05, max_semantic_std=0.1, max_clusters=None):
-    """
-    Split clusters with high spatial or semantic variance.
-    Returns: new_cluster_ids (same shape), new_num_clusters (int)
-    If max_clusters is provided, never exceed it: instead pick the largest-variance cluster splits up to capacity.
-    """
-    device = gaussians_xyz.device
-    cur_ids = cluster_ids.clone()
-    num_clusters = int(cur_ids.max().item()) + 1
-    new_ids = cur_ids.clone()
-
-    next_id = num_clusters
-    potential_splits = []
-
-    for cid in range(num_clusters):
-        mask = cur_ids == cid
-        if mask.sum() < 2:
-            continue
-        xyz_c = gaussians_xyz[mask]
-        sem_c = gaussians_sem[mask]
-        spatial_std = float(xyz_c.std(dim=0).mean().item())
-        sem_std = float(sem_c.std().item())
-
-        if spatial_std > max_dispersion or sem_std > max_semantic_std:
-            potential_splits.append((cid, spatial_std + sem_std, mask.nonzero(as_tuple=True)[0]))
-
-    # sort splits by descending variance so we perform most-important splits first
-    potential_splits.sort(key=lambda x: x[1], reverse=True)
-
-    for cid, score, idxs in potential_splits:
-        # respect max_clusters if given
-        if max_clusters is not None and next_id >= max_clusters:
-            break
-
-        mask = (cur_ids == cid)
-        xyz_c = gaussians_xyz[mask]
-        # compute principal axis
-        cov = torch.cov(xyz_c.T)
-        eigvals, eigvecs = torch.linalg.eigh(cov)
-        principal_axis = eigvecs[:, -1]
-        proj = (xyz_c - xyz_c.mean(dim=0)) @ principal_axis
-        med = proj.median()
-        split_mask_local = proj > med
-
-        # global indices of elements in this cluster
-        global_idx = mask.nonzero(as_tuple=True)[0]
-        to_split_idx = global_idx[split_mask_local]
-        if to_split_idx.numel() == 0:
-            continue
-
-        new_ids[to_split_idx] = next_id
-        next_id += 1
-
-    # Finally reindex sequentially to avoid sparse id space
-    unique, inv = torch.unique(new_ids, return_inverse=True)
-    new_num = unique.numel()
-    new_ids[:] = inv
-
-    # If max_clusters provided: cap new_num <= max_clusters (we re-map extra clusters to nearest existing)
-    if max_clusters is not None and new_num > max_clusters:
-        # map extra ids to nearest cluster centroid (simple heuristic). For simplicity, reassign highest ids to nearest lower ones.
-        # Build centroids for new_ids
-        centroids = []
-        for cid in range(new_num):
-            m = new_ids == cid
-            if m.sum() == 0:
-                centroids.append(torch.zeros(3, device=device))
-            else:
-                centroids.append(gaussians_xyz[m].mean(0))
-        centroids = torch.stack(centroids, dim=0)
-        # compute distances between centroids and collapse highest ids into nearest lower ids until <= max_clusters
-        while new_num > max_clusters:
-            # collapse last id into nearest other
-            last = new_num - 1
-            d = torch.norm(centroids - centroids[last].unsqueeze(0), dim=1)
-            d[last] = float('inf')
-            target = int(torch.argmin(d).item())
-            new_ids[new_ids == last] = target
-            # recompute unique/inv
-            unique, inv = torch.unique(new_ids, return_inverse=True)
-            new_ids[:] = inv
-            new_num = unique.numel()
-            # recompute centroids (cheap because new_num small)
-            centroids = []
-            for cid in range(new_num):
-                m = new_ids == cid
-                if m.sum() == 0:
-                    centroids.append(torch.zeros(3, device=device))
-                else:
-                    centroids.append(gaussians_xyz[m].mean(0))
-            centroids = torch.stack(centroids, dim=0)
-
-    return new_ids, int(new_num)
-
-
-def select_top_gaussians_by_distance(segmented_gaussians, cluster_centroids, n_active):
-    """
-    Select the top `n_active` Gaussians closest to each cluster centroid.
-
-    Args:
-        segmented_gaussians (GaussianModel): GaussianModel object with get_xyz [N, 3].
-        cluster_centroids (Tensor): Tensor of cluster centroids [num_clusters, 3].
-        n_active (int): Number of Gaussians to select per cluster.
-
-    Returns:
-        LongTensor: Indices of selected Gaussians.
-    """
-    xyz = segmented_gaussians.get_xyz  # [N, 3]
-    num_clusters = cluster_centroids.shape[0]
-
-    selected_indices = []
-
-    # Compute distances and pick closest n_active per cluster
-    for i in range(num_clusters):
-        centroid = cluster_centroids[i].unsqueeze(0)  # [1,3]
-        dists = torch.norm(xyz - centroid, dim=1)     # [N]
-        closest = torch.topk(dists, k=min(n_active, xyz.shape[0]), largest=False).indices
-        selected_indices.append(closest)
-
-    # Flatten and unique
-    selected_indices = torch.unique(torch.cat(selected_indices))
-    return selected_indices
-
-
-def safe_index_tensor(index_tensor, max_index):
-    """
-    Clamp invalid indices to 0 and return a boolean mask of valid entries.
-    index_tensor: LongTensor of arbitrary shape
-    max_index: exclusive upper bound (int)
-    returns: (safe_index_tensor, valid_mask) where valid_mask = index_tensor >=0 & < max_index
-    """
-    valid_mask = (index_tensor >= 0) & (index_tensor < max_index)
-    safe = index_tensor.clone()
-    safe[~valid_mask] = 0
-    return safe.long(), valid_mask
-
-
-def load_instance_masks(mask_dir, basename, device="cuda"):
-    """
-    Load all instance masks for a given RGB image basename.
-    Returns:
-        instance_masks_list: list of (instance_id, mask_tensor) tuples, mask_tensor [H, W]
-        masks_tensor: FloatTensor [num_instances, H, W], 0-1
-        num_instances: int
-    """
-    instance_masks_list = []
-    mask_tensors = []
-
-    pattern = os.path.join(mask_dir, f"{basename}_instance_*.png")
-    files = sorted(glob.glob(pattern))
-
-    for i, fpath in enumerate(files):
-        mask = Image.open(fpath).convert("L")  # grayscale
-        mask_np = np.array(mask, dtype=np.float32) / 255.0  # [H, W], float in [0,1]
-        mask_tensor = torch.from_numpy(mask_np).to(device)
-        instance_masks_list.append((i, mask_tensor))
-        mask_tensors.append(mask_tensor)
-
-    if mask_tensors:
-        masks_tensor = torch.stack(mask_tensors, dim=0)  # [num_instances, H, W]
-    else:
-        masks_tensor = torch.zeros((0, 0, 0), device=device)
-
-    num_instances = len(instance_masks_list)
-
-    return instance_masks_list, masks_tensor, num_instances
-
-
-def enforce_multicam_consistency_instance(cluster_ids, xyz, cameras, mask_inst_dir,
-                                          pixel_tolerance=2.0, min_view_support=2, device="cuda"):
-    """
-    Enforce multi-camera consistency by merging clusters whose projections overlap
-    in at least `min_view_support` cameras *and* correspond to the same instance ID.
-
-    Args:
-        cluster_ids (Tensor): [N] cluster assignment per Gaussian
-        xyz (Tensor): [N, 3] world-space Gaussian centers
-        cameras (list): list of Camera objects
-        mask_inst_dir (str): path to instance mask folder
-        pixel_tolerance (float)
-        min_view_support (int)
-    """
-    merged_ids = cluster_ids.clone().to(device)
-
-    # Cache per-camera projections and instance masks
-    reproj_dict = {}
-    instance_dict = {}
-
-    for cam_idx, cam in enumerate(cameras):
-        basename = os.path.splitext(os.path.basename(cam.image_name))[0]
-        instance_dict[cam_idx] = load_instance_masks(mask_inst_dir, basename, device=device)
-
-        # Build proper intrinsic matrix 3x3 from FoV
-        width, height = cam.image_width, cam.image_height
-        fx = 0.5 * width / torch.tan(torch.tensor(cam.FoVx / 2))
-        fy = 0.5 * height / torch.tan(torch.tensor(cam.FoVy / 2))
-        cx = width / 2
-        cy = height / 2
-        K = torch.tensor([[fx, 0, cx],
-                          [0, fy, cy],
-                          [0, 0, 1]], device=device, dtype=torch.float32)
-
-        # Project points
-        pts_h = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=-1)       # [N,4]
-        cam_pts = (cam.world_view_transform @ pts_h.T).T                     # [N,4]
-        cam_pts = cam_pts[:, :3] / cam_pts[:, 3:4]                           # [N,3]
-        uv = (K @ cam_pts.T)[:2, :].T                                        # [N,2] pixel coordinates
-        reproj_dict[cam_idx] = uv
-
-    # Compare clusters pairwise
-    unique_clusters = torch.unique(merged_ids)
-    for i, cid_a in enumerate(unique_clusters):
-        for cid_b in unique_clusters[i + 1:]:
-            mask_a = (merged_ids == cid_a)
-            mask_b = (merged_ids == cid_b)
-            if not mask_a.any() or not mask_b.any():
+        for pid in pids_sorted:
+            if clusters[pid] == -1:
+                continue
+            current_cid = clusters[pid]
+            if len(cluster_points.get(current_cid, [])) <= 1:
                 continue
 
-            overlap_views = 0
-            consistent_instance = 0
-
-            for cam_idx, uv in reproj_dict.items():
-                inst_masks = instance_dict[cam_idx]
-
-                ua = uv[mask_a]
-                ub = uv[mask_b]
-                if ua.numel() == 0 or ub.numel() == 0:
+            best_cid = current_cid
+            best_score = score
+            for cid in cid_list:
+                if cid == current_cid:
                     continue
+                dist = np.linalg.norm(get_xyz(pid) - centroids[cid])
+                spatial_factor = np.exp(-spatial_consistency_weight * dist)
+                tmp_score = geom_with_coh * spatial_factor
 
-                dist = torch.cdist(ua, ub)
-                if not (dist < pixel_tolerance).any():
-                    continue  # no geometric overlap
+                if tmp_score > best_score:
+                    best_score = tmp_score
+                    best_cid = cid
+                elif temperature > 0:
+                    delta = tmp_score - score
+                    if delta < 0 and np.random.rand() < np.exp(delta / (temperature + eps)):
+                        best_score = tmp_score
+                        best_cid = cid
+            clusters[pid] = best_cid
 
-                overlap_views += 1
-
-                # Check instance masks
-                for inst_id, mask_tensor in inst_masks:
-                    h, w = mask_tensor.shape
-                    # Convert uv -> pixel coords
-                    pa = (ua * torch.tensor([w, h], device=device)).long()
-                    pb = (ub * torch.tensor([w, h], device=device)).long()
-
-                    # Clamp each axis separately
-                    pa[:, 0] = pa[:, 0].clamp(0, w - 1)
-                    pa[:, 1] = pa[:, 1].clamp(0, h - 1)
-                    pb[:, 0] = pb[:, 0].clamp(0, w - 1)
-                    pb[:, 1] = pb[:, 1].clamp(0, h - 1)
-                    if (mask_tensor[pa[:, 1], pa[:, 0]].mean() > 0.5 and
-                        mask_tensor[pb[:, 1], pb[:, 0]].mean() > 0.5):
-                        consistent_instance += 1
-                        break
-
-            if overlap_views >= min_view_support and consistent_instance > 0:
-                merged_ids[mask_b] = cid_a
-
-    # Reindex to contiguous IDs
-    unique_ids = torch.unique(merged_ids)
-    id_map = {old.item(): new for new, old in enumerate(unique_ids)}
-    merged_ids = torch.tensor([id_map[i.item()] for i in merged_ids], device=device, dtype=torch.long)
-
-    return merged_ids
-
-
-    def merge_clusters_sparse(A: torch.sparse_coo_tensor, device="cuda"):
-        """
-        Merge Gaussians via sparse adjacency to mask instances.
-        
-        Args:
-            A: torch.sparse_coo_tensor [G, M], values=1
-            device: cuda/cpu
-            
-        Returns:
-            merged_cluster_ids: torch.Tensor [G]
-        """
-        # COO format indices
-        indices = A.coalesce().indices()  # [2, nnz], row=gaussian, col=mask_instance
-        row, col = indices[0], indices[1]
-
-        num_gaussians = A.size(0)
-
-        # Union-Find
-        parent = torch.arange(num_gaussians, device=device)
-
-        def find(x):
-            root = x
-            while parent[root] != root:
-                root = parent[root]
-            while parent[x] != x:
-                nxt = parent[x]
-                parent[x] = root
-                x = nxt
-            return root
-
-        def union(x, y):
-            root_x = find(x)
-            root_y = find(y)
-            if root_x != root_y:
-                parent[root_y] = root_x
-
-        # Iterate over mask instances
-        unique_masks = torch.unique(col)
-        for m in unique_masks:
-            gaussians = row[col == m]
-            if len(gaussians) > 1:
-                base = gaussians[0]
-                for g in gaussians[1:]:
-                    union(base.item(), g.item())
-
-        # Assign final cluster IDs
-        roots = torch.tensor([find(i) for i in range(num_gaussians)], device=device)
-        _, merged_cluster_ids = torch.unique(roots, return_inverse=True)
-
-        return merged_cluster_ids
-
-
-    def compute_mask_center_weights(A, instance_centroids, gaussians_xyz, sigma=0.1):
-        """
-        Compute reliability weights per Gaussian based on distance to its assigned mask-instance centroid.
-
-        Args:
-            A (torch.sparse_coo_tensor): sparse adjacency matrix [N_gaussians, M_mask_instances]
-            instance_centroids (torch.Tensor): [M,3] tensor of mask-instance centroids
-            gaussians_xyz (torch.Tensor): [N,3] tensor of Gaussian positions
-            sigma (float): controls decay of weight with distance
-
-        Returns:
-            torch.Tensor: [N] weights in [0,1]
-        """
-        device = gaussians_xyz.device
-        A = A.coalesce()
-        gaussian_ids, mask_ids = A.indices()  # [nnz], [nnz]
-
-        # Get coordinates
-        pts_gauss = gaussians_xyz[gaussian_ids]       # [nnz, 3]
-        pts_mask  = instance_centroids[mask_ids]     # [nnz, 3]
-
-        # Compute distance and convert to weight
-        dists = torch.norm(pts_gauss - pts_mask, dim=1)           # [nnz]
-        weights_per_edge = torch.exp(-dists / sigma)              # Gaussian decay
-
-        # Accumulate per Gaussian
-        weights = torch.zeros(gaussians_xyz.shape[0], device=device)
-        counts  = torch.zeros_like(weights)
-        weights.index_add_(0, gaussian_ids, weights_per_edge)
-        counts.index_add_(0, gaussian_ids, torch.ones_like(weights_per_edge))
-
-        # Avoid division by zero
-        counts = torch.clamp(counts, min=1.0)
-        weights = weights / counts
-
-        return weights
-
-
+    self.point_clusters = clusters
+    return clusters
 

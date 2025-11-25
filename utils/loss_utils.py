@@ -18,6 +18,15 @@ try:
 except:
     pass
 
+
+# -----------------------------
+# FULL TRAINING LOSSES
+# -----------------------------
+
+# -----------------------------
+# Appareance rendering losses
+# -----------------------------
+
 C1 = 0.01 ** 2
 C2 = 0.03 ** 2
 
@@ -89,10 +98,10 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 def fast_ssim(img1, img2):
     ssim_map = FusedSSIMMap.apply(C1, C2, img1, img2)
     return ssim_map.mean()
-    
-# -----------------------------
+
+# -------------------------------------
 # Binary mask render loss (weighted)
-# -----------------------------
+# -------------------------------------
 def binary_mask_render_loss(gaussians_mask, contrib_indices, contrib_opacities, gt_mask, alpha_mask=None):
     """
     Compute differentiable binary mask loss for Gaussian contributions,
@@ -136,6 +145,25 @@ def binary_mask_render_loss(gaussians_mask, contrib_indices, contrib_opacities, 
     return loss
 
 
+
+
+
+# -----------------------------
+# CLUSTERING LOSSES
+# -----------------------------
+
+
+# -------------------------
+# Utilities
+# -------------------------
+def safe_prob(p, eps=1e-8):
+    return torch.clamp(p, eps, 1.0)
+
+def softmax_logits(u, temperature=1.0):
+    if temperature != 1.0:
+        return F.softmax(u / temperature, dim=1)
+    return F.softmax(u, dim=1)
+
 # -----------------------------
 # Compute mask-center weights
 # -----------------------------
@@ -154,198 +182,371 @@ def compute_mask_center_weights(mask_tensor):
     return torch.from_numpy(dist_map).float().to(mask_tensor.device)
 
 
-# -----------------------------
-# Pseudo-GT from top-K (weighted version)
-# -----------------------------
-def pseudo_gt_from_topK(gaussians, topK_contrib_indices, mask_images, mask_weights=None):
+# -------------------------
+# Losses
+# -------------------------
+def loss_label_ce(p, y, mask, weight=None, eps=1e-8):
+    # Convert logits to safe probs (avoid log(0))
+    p = safe_prob(p, eps)
+
+    # Standard cross-entropy: −Σ y * log(p) over classes
+    ce = -(y * torch.log(p)).sum(dim=1)
+
+    # Optional per-sample weighting
+    if weight is not None:
+        ce = ce * weight
+
+    # Mask out invalid samples
+    ce = ce * mask
+    return ce.mean()
+
+
+def loss_pairwise_symmetric_kl(p, pairs_j, pairs_k, weights=None, eps=1e-8):
+    # Probabilities for paired indices
+    p_j = safe_prob(p[pairs_j], eps)
+    p_k = safe_prob(p[pairs_k], eps)
+
+    # KL(p_j || p_k)
+    kl_jk = (p_j * (torch.log(p_j) - torch.log(p_k))).sum(dim=1)
+
+    # KL(p_k || p_j)
+    kl_kj = (p_k * (torch.log(p_k) - torch.log(p_j))).sum(dim=1)
+
+    # Symmetric KL = KL(j,k) + KL(k,j)
+    loss = kl_jk + kl_kj
+
+    # Optional pair weights
+    if weights is not None:
+        loss = loss * weights
+
+    return loss.mean() if loss.numel() > 0 else torch.tensor(0.0, device=p.device)
+
+
+def loss_propagation(p, A):
+    # (I - A) p enforces consistency with affinity graph
+    I_minus_A = torch.eye(A.size(0), device=p.device) - A
+    diff = I_minus_A @ p
+
+    # L2 norm per node averaged
+    return (diff * diff).sum(dim=1).mean()
+
+
+def loss_smoothness(q, Kmat):
+    # Pairwise differences: [G,G,K]
+    diff = q.unsqueeze(1) - q.unsqueeze(0)
+
+    # Squared L2 distance per pair
+    dist2 = (diff * diff).sum(dim=2)
+
+    # Weighted by kernel matrix Kmat
+    return (Kmat * dist2).mean()
+
+
+def loss_marginal_entropy(p, eps=1e-8):
+    # Compute class marginals m_k = 1/N Σ p_ik
+    m = safe_prob(p.mean(dim=0), eps)
+
+    # Σ m log m (negative entropy)
+    return (m * torch.log(m)).sum()
+
+
+def binary_mask_render_loss(gaussians_mask, contrib_indices, contrib_opacities, gt_mask, alpha_mask=None):
+    # contrib_indices: [H,W,K] gives gaussian idx per pixel per depth-sorted layer
+    H, W, K = contrib_indices.shape
+    device = gaussians_mask.device
+
+    # Validity mask for indices (-1 entries mean empty layer)
+    valid_mask = (contrib_indices >= 0)
+
+    # Replace invalid indices with zero (safe indexing)
+    safe_indices = torch.clamp(contrib_indices, min=0).long()
+
+    # Gather gaussian mask values per contributing gaussian
+    f_i = gaussians_mask[safe_indices]      # [H,W,K]
+    f_i = f_i * valid_mask.float()
+
+    # Also mask opacities
+    contrib_opacities = contrib_opacities * valid_mask.float()
+
+    # Compute cumulative transparency product (alpha compositing)
+    alpha_prod = torch.cumprod(1.0 - contrib_opacities, dim=2)
+
+    # Shift alpha_prod to get transparency *before* each layer
+    alpha_prod = torch.cat([torch.ones((H, W, 1), device=device),
+                            alpha_prod[:, :, :-1]], dim=2)
+
+    # Rendered foreground = Σ f_i * α_i * T_i
+    F_rendered = (f_i * contrib_opacities * alpha_prod).sum(dim=2)
+    F_rendered = torch.clamp(F_rendered, 0.0, 1.0)
+
+    # Optional external mask
+    if alpha_mask is not None:
+        F_rendered = F_rendered * alpha_mask
+
+    # Ensure shape matches gt
+    if F_rendered.shape != gt_mask.shape:
+        F_rendered = F_rendered.squeeze(0)
+
+    # BCE loss against ground-truth binary instance mask
+    loss = F.binary_cross_entropy(F_rendered, gt_mask.float())
+    return loss
+
+
+# ============================================================
+#               Explicit Gradients w.r.t p_j
+# ============================================================
+
+def grad_label_ce(p, y, mask, weight=None, eps=1e-8):
+    # Safe probabilities
+    p = safe_prob(p, eps)
+
+    # d/dp of CE = − y / p
+    g = -(y / torch.clamp(p, min=1e-8))
+
+    if weight is not None:
+        g = g * weight.unsqueeze(1)
+
+    g = g * mask.unsqueeze(1)
+    return g
+
+
+def grad_pairwise_symmetric_kl(p, pairs_j, pairs_k, weights=None, eps=1e-8):
+    # Safe probability
+    p = safe_prob(p, eps)
+    N, K = p.shape
+
+    g = torch.zeros_like(p)
+
+    pj = torch.clamp(p[pairs_j], min=1e-8)
+    pk = torch.clamp(p[pairs_k], min=1e-8)
+
+    # Grad of KL(pj || pk) wrt pj and pk
+    grad_j = torch.log(pj) - torch.log(pk) + 1 - pk / pj
+    grad_k = torch.log(pk) - torch.log(pj) + 1 - pj / pk
+
+    # Remove NaN / inf (rare but safe)
+    grad_j = torch.nan_to_num(grad_j, nan=0.0, posinf=0.0, neginf=0.0)
+    grad_k = torch.nan_to_num(grad_k, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if weights is not None:
+        grad_j = grad_j * weights.unsqueeze(1)
+        grad_k = grad_k * weights.unsqueeze(1)
+
+    # Accumulate gradients for each index
+    g.index_add_(0, pairs_j, grad_j)
+    g.index_add_(0, pairs_k, grad_k)
+
+    # Normalize for stability
+    g = g / max(1.0, pairs_j.numel())
+    return g
+
+
+def grad_propagation(p, A):
+    # Gradient of ||(I - A)p||^2
+    I_minus_A = torch.eye(A.size(0), device=p.device) - A
+
+    # 2 (I-A)^T (I-A) p / N
+    g = 2 * (I_minus_A.T @ (I_minus_A @ p)) / p.size(0)
+    return g
+
+
+def grad_marginal_entropy(p, eps=1e-8):
+    # m_k = marginal distribution over clusters
+    N, K = p.shape
+    m = safe_prob(p.mean(dim=0), eps)
+
+    # d/dp_i = (log m + 1) / N
+    gm = (torch.log(m) + 1.0) / N
+    return gm.unsqueeze(0).repeat(N, 1)
+
+
+def grad_smoothness(q, Kmat):
+    G, K = q.shape
+
+    # diff[g1,g2] = q1 - q2
+    diff = q.unsqueeze(1) - q.unsqueeze(0)
+
+    # Gradient wrt q[g]: Σ_{g2} K[g,g2] * 2(q[g] - q[g2])
+    grad = 2.0 * (Kmat.unsqueeze(2) * diff).sum(dim=1) / max(1.0, G)
+    return grad
+
+
+# ============================================================
+#   Aggregate point-level grads → Gaussian-level grads
+# ============================================================
+
+def aggregate_gaussian_grads(r_point_idx, r_gauss_idx, r_vals, g_point, N_seg):
     """
-    Compute per-Gaussian pseudo-ground-truth semantic values using
-    precomputed top-K contributor pixel indices, optionally weighted by mask-center confidence.
-
-    Args:
-        gaussians (GaussianModel)
-        topK_contrib_indices: [N, num_cameras, K] pixel indices
-        mask_images: [num_cameras, H*W] normalized 0-1 masks
-        mask_weights: [num_cameras, H*W] optional float weights per pixel
-
-    Returns:
-        tuple: (pseudo_gt, counts)
-            pseudo_gt: [N] averaged mask values for each Gaussian
-            counts: [N] sum of weights or valid contributions
+    Aggregate gradients from points to gaussian segments.
+    r_gauss_idx MUST lie in [0, N_seg).
     """
-    if topK_contrib_indices is None or mask_images is None:
-        raise ValueError("Both topK_contrib_indices and mask_images are required for pseudo-GT computation.")
+    device = g_point.device
+    K = g_point.size(1)
 
-    N, num_cameras, K = topK_contrib_indices.shape
-    device = gaussians.semantic_mask.device
+    # Select gradient for each contributing point
+    g_j_selected = g_point[r_point_idx]        # [M,K]
 
-    pseudo_gt = torch.zeros(N, device=device, dtype=torch.float32)
-    counts = torch.zeros(N, device=device, dtype=torch.float32)
+    # Multiply by scalar contribution r_vals per mapping
+    contrib = r_vals.unsqueeze(1) * g_j_selected
 
-    for cam_idx in range(num_cameras):
-        pixels = topK_contrib_indices[:, cam_idx, :]  # [N, K]
-        valid = pixels >= 0
-        safe_pixels = pixels.clone()
-        safe_pixels[~valid] = 0
-
-        cam_mask = mask_images[cam_idx].view(-1)
-        max_pix = cam_mask.numel()
-        safe_pixels = torch.clamp(safe_pixels, 0, max_pix - 1)
-
-        mask_vals = cam_mask[safe_pixels]  # [N,K]
-        mask_vals[~valid] = 0.0
-
-        if mask_weights is not None:
-            weight_map = mask_weights[cam_idx].view(-1)
-            weight_vals = weight_map[safe_pixels]
-            weight_vals[~valid] = 0.0
-        else:
-            weight_vals = valid.float()
-
-        pseudo_gt += (mask_vals * weight_vals).sum(dim=1)
-        counts += weight_vals.sum(dim=1)
-
-    valid_counts = counts > 0
-    pseudo_gt[valid_counts] /= counts[valid_counts]
-
-    return pseudo_gt, counts
+    # Accumulate into per-gaussian gradient
+    G_accum = torch.zeros((N_seg, K), device=device)
+    G_accum.index_add_(0, r_gauss_idx, contrib)
+    return G_accum
 
 
+def logits_grad_from_q_grads(u, G_agg, temperature=1.0):
+    # Convert NaNs/Infs to zeros for safety
+    G_agg = torch.nan_to_num(G_agg, nan=0.0, posinf=0.0, neginf=0.0)
 
-# -----------------------------
-# Semantic loss from pseudo-GT
-# -----------------------------
-def semantic_loss_from_topK(gaussians, pseudo_gt, counts, λ_sem=1.0):
+    # q = softmax(u)
+    q = softmax_logits(u, temperature)
+
+    # inner = q ⋅ G_agg (vector)
+    inner = (q * G_agg).sum(dim=1, keepdim=True)
+
+    # Softmax-Jacobian product: q * (G_agg − inner)
+    grad_u = q * (G_agg - inner)
+    return grad_u
+
+
+# ============================================================
+#          Total cluster loss + gradients pipeline
+# ============================================================
+
+def total_cluster_loss(
+    gaussians,
+    r_point_idx,
+    r_gauss_idx,
+    r_vals,
+    p_j,
+    q_i,
+    pair_j=None,
+    pair_k=None,
+    pair_weights=None,
+    A=None,
+    Kmat=None,
+    gaussians_mask=None,
+    contrib_indices=None,
+    contrib_opacities=None,
+    gt_mask=None,
+    alpha_mask=None,
+    use_label_ce=True,
+    use_pair_kl=False,
+    use_prop=False,
+    use_smooth=False,
+    use_marg=False,
+    use_instance_render=False,
+    debug=False
+):
     """
-    Weighted MSE loss between predicted semantics and pseudo-GT mask values.
+    Compute total instance-field clustering loss and the gradients w.r.t
+    Gaussian logits q_i.
 
-    Args:
-        gaussians (GaussianModel): Contains .semantic_mask [N, 1]
-        pseudo_gt (Tensor): [N] averaged semantic supervision
-        counts (Tensor): [N] number of valid pixel contributions
-        λ_sem (float): Weight of semantic loss
-
-    Returns:
-        Tensor: Weighted scalar loss
+    p_j: point-level cluster probabilities
+    q_i: gaussian-level logits
     """
-    preds = torch.sigmoid(gaussians.semantic_mask.squeeze())  # [N]
-    valid = counts > 0
 
-    if valid.sum() == 0:
-        return torch.tensor(0.0, device=preds.device, requires_grad=True)
+    device = p_j.device
+    N_seg = gaussians.get_xyz.shape[0]
+    K = q_i.shape[1]
 
-    weights = counts[valid] / (counts[valid].sum() + 1e-8)
-    loss = ((preds[valid] - pseudo_gt[valid]) ** 2) * weights
+    loss_vals = {}
+    total_loss = torch.tensor(0.0, device=device)
 
-    return λ_sem * loss.sum()
+    # Gradients for point assignments (p_j)
+    grad_p = torch.zeros_like(p_j)
 
+    # Gradients for gaussian logits (q_i)
+    grad_q_gauss = torch.zeros_like(q_i)
 
-# -----------------------------
-# Hybrid spatial-semantic loss
-# -----------------------------
-def hybrid_spatial_semantic_loss(positions, semantics, alpha=10.0, neighbor_radius=0.05, λ_sem=1.0, debug=False):
-    """
-    Compute a spatial + semantic smoothness loss among nearby Gaussians.
+    # -------------------------
+    # Label Cross-Entropy
+    # -------------------------
+    if use_label_ce:
+        L_label = loss_label_ce(p_j, p_j, torch.ones(p_j.shape[0], device=device))
+        loss_vals['label_ce'] = L_label
+        total_loss += L_label
 
-    Args:
-        positions (Tensor): [N, 3] Gaussian centroids
-        semantics (Tensor): [N] or [N, C] semantic values
-        alpha (float): Relative weighting for the semantic part
-        neighbor_radius (float): Maximum distance for neighbor consideration
-        λ_sem (float): Weight scaling for semantic loss term
-        debug (bool): If True, print loss components
-
-    Returns:
-        Tensor: Scalar total hybrid loss
-    """
-    N = positions.shape[0]
-    if N <= 1:
-        return torch.tensor(0.0, device=positions.device, requires_grad=True)
-
-    pos_diff = positions.unsqueeze(1) - positions.unsqueeze(0)  # [N, N, 3]
-    dist = torch.norm(pos_diff, dim=-1)  # [N, N]
-
-    spatial_mask = (dist < neighbor_radius).float()
-    denom = max(1.0, spatial_mask.sum().item())
-
-    spatial_loss = (dist * spatial_mask).sum() / denom
-
-    if semantics.ndim == 1:
-        semantic_diff = (semantics.unsqueeze(1) - semantics.unsqueeze(0)).abs()
+        grad_p += grad_label_ce(p_j, p_j, torch.ones(p_j.shape[0], device=device))
     else:
-        semantic_diff = torch.norm(semantics.unsqueeze(1) - semantics.unsqueeze(0), dim=-1)
+        loss_vals['label_ce'] = torch.tensor(0.0, device=device)
 
-    semantic_loss = (semantic_diff * spatial_mask).sum() / denom
+    # -------------------------
+    # Pairwise Symmetric KL
+    # -------------------------
+    if use_pair_kl and pair_j is not None and pair_k is not None:
+        L_pair = loss_pairwise_symmetric_kl(p_j, pair_j, pair_k, pair_weights)
+        loss_vals['pair_kl'] = L_pair
+        total_loss += L_pair
 
-    total_loss = spatial_loss + alpha * λ_sem * semantic_loss
-
-    if debug:
-        print(f"[DEBUG] hybrid_loss: total={total_loss.item():.6f}, "
-              f"spatial={spatial_loss.item():.6f}, semantic={semantic_loss.item():.6f}, "
-              f"N={N}, neighbors={int(spatial_mask.sum().item())}")
-
-    return total_loss
-
-
-# -----------------------------
-# Total cluster loss
-# -----------------------------
-def total_cluster_loss(gaussians,
-                       topK_contrib_indices=None,
-                       mask_images=None,
-                       mask_weights=None,  # new optional argument
-                       alpha=10.0,
-                       neighbor_radius=0.05,
-                       λ_sem=1.0,
-                       active_positions=None,
-                       active_semantics=None,
-                       debug=False):
-    """
-    Combined hybrid spatial + semantic loss for Gaussian clustering with optional mask-center weighting.
-
-    Args:
-        gaussians (GaussianModel): Gaussian model with xyz and semantics
-        topK_contrib_indices (Tensor): Optional pixel indices for pseudo-GT
-        mask_images (Tensor): Optional mask images for pseudo-GT supervision
-        mask_weights (Tensor): Optional weights emphasizing mask centers [num_cameras, H*W]
-        alpha (float): Weight for semantic term in hybrid loss
-        neighbor_radius (float): Radius for spatial neighbor computations
-        λ_sem (float): Weight for semantic supervision
-        active_positions (Tensor): Optional subset of positions [N_active, 3]
-        active_semantics (Tensor): Optional subset of semantics [N_active]
-        debug (bool): If True, prints debug info
-
-    Returns:
-        Tuple[Tensor, Tensor, Tensor]: total_loss, hybrid_loss, semantic_loss
-    """
-    if active_positions is None:
-        positions = gaussians.get_xyz
-        semantics = torch.sigmoid(gaussians.semantic_mask.squeeze())
+        grad_p += grad_pairwise_symmetric_kl(p_j, pair_j, pair_k, pair_weights)
     else:
-        positions = active_positions
-        semantics = active_semantics
+        loss_vals['pair_kl'] = torch.tensor(0.0, device=device)
 
-    # Base hybrid spatial-semantic loss
-    hybrid_loss = hybrid_spatial_semantic_loss(
-        positions, semantics, alpha=alpha, neighbor_radius=neighbor_radius, λ_sem=λ_sem, debug=debug
+    # -------------------------
+    # Graph Propagation Loss
+    # -------------------------
+    if use_prop and A is not None:
+        L_prop = loss_propagation(p_j, A)
+        loss_vals['prop'] = L_prop
+        total_loss += L_prop
+
+        grad_p += grad_propagation(p_j, A)
+    else:
+        loss_vals['prop'] = torch.tensor(0.0, device=device)
+
+    # -------------------------
+    # Gaussian Logit Smoothness
+    # -------------------------
+    if use_smooth and Kmat is not None:
+        L_smooth = loss_smoothness(q_i, Kmat)
+        loss_vals['smooth'] = L_smooth
+        total_loss += L_smooth
+
+        grad_q_gauss += grad_smoothness(q_i, Kmat)
+    else:
+        loss_vals['smooth'] = torch.tensor(0.0, device=device)
+
+    # -------------------------
+    # Marginal Entropy Regularizer
+    # -------------------------
+    if use_marg:
+        L_marg = loss_marginal_entropy(p_j)
+        loss_vals['marg'] = L_marg
+        total_loss += L_marg
+
+        grad_p += grad_marginal_entropy(p_j)
+    else:
+        loss_vals['marg'] = torch.tensor(0.0, device=device)
+
+    # -------------------------
+    # Optional Rendering-based Loss
+    # -------------------------
+    if use_instance_render and gaussians_mask is not None:
+        L_render = binary_mask_render_loss(
+            gaussians_mask, contrib_indices, contrib_opacities, gt_mask, alpha_mask
+        )
+        loss_vals['instance_render'] = L_render
+        total_loss += L_render
+
+        # Rendering loss gradient contribution (placeholder = ones)
+        grad_q_gauss += aggregate_gaussian_grads(
+            r_point_idx, r_gauss_idx, r_vals,
+            torch.ones_like(p_j),     # dummy grad
+            N_seg
+        )
+    else:
+        loss_vals['instance_render'] = torch.tensor(0.0, device=device)
+
+    # ============================================================
+    # Aggregate point-level gradients → gaussian-level gradients
+    # ============================================================
+    grad_q_from_p = aggregate_gaussian_grads(
+        r_point_idx, r_gauss_idx, r_vals, grad_p, N_seg
     )
 
-    # Semantic supervision from pseudo-GT
-    semantic_loss = torch.tensor(0.0, device=positions.device)
-    if topK_contrib_indices is not None and mask_images is not None:
-        pseudo_gt, counts = pseudo_gt_from_topK(
-            gaussians, topK_contrib_indices, mask_images, mask_weights=mask_weights
-        )
-        semantic_loss = semantic_loss_from_topK(gaussians, pseudo_gt, counts, λ_sem=λ_sem)
-        total_loss = hybrid_loss + semantic_loss
-    else:
-        total_loss = hybrid_loss
+    # Convert aggregated q-gradients to logit-gradients through softmax jacobian
+    grad_q_gauss += logits_grad_from_q_grads(q_i, grad_q_from_p)
 
-    if debug:
-        print(f"[DEBUG] total_cluster_loss: total={total_loss.item():.6f}, "
-              f"hybrid={hybrid_loss.item():.6f}, semantic={semantic_loss.item():.6f}, "
-              f"num_points={positions.shape[0]}")
-
-    return total_loss, hybrid_loss, semantic_loss
-
-
+    return total_loss, loss_vals, grad_q_gauss

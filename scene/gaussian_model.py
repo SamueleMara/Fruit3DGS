@@ -1,4 +1,13 @@
-# <same header as before>
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
 
 import torch
 import numpy as np
@@ -55,7 +64,16 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
-        self.semantic_mask = None  
+
+        # -----------------------------
+        # Semantic mask field
+        # -----------------------------
+        self.semantic_mask = None
+        # -----------------------------
+        # Instance segmentation fields
+        # -----------------------------
+        self.instance_logits = None   # will be created later
+        self.instance_ids = None      # hard labels (no grad) 
 
     def capture(self):
         return (
@@ -589,3 +607,16 @@ class GaussianModel:
         PlyData([el]).write(path)
 
         print(f"[OK] Clustered PLY saved at {path}")
+
+    def set_instance_fields(self, num_points, num_instances, device):
+        """
+        Create and initialize instance_logits + instance_ids.
+        Called once before training.
+        """
+        # trainable logits: [N, G]
+        self.instance_logits = torch.nn.Parameter(
+            torch.zeros(num_points, num_instances, device=device)
+        )
+
+        # non-trainable hard labels: [N]
+        self.instance_ids = torch.zeros(num_points, dtype=torch.long, device=device)

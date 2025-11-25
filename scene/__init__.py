@@ -13,12 +13,16 @@ import os
 import random
 import json
 import numpy as np
+import math
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from utils.read_write_model import read_model
+from utils.cluster_utils import compute_mask_centroids,refine_clusters_with_metric
+from utils.visualize_clusters import visualize_colmap_clusters
+from utils import masks_utils
 from scene.colmap_masker import ColmapMaskFilter
 
 from utils.system_utils import mkdir_p
@@ -26,10 +30,30 @@ from plyfile import PlyData, PlyElement
 
 from pathlib import Path
 from tqdm import tqdm
-import glob
+import glob, json
 from collections import defaultdict
 import torch
 from PIL import Image
+
+from scipy.spatial import cKDTree
+from sklearn.neighbors import KDTree
+from skopt import gp_minimize
+
+HAVE_CUML = False
+try:
+    from cuml.cluster import DBSCAN as cuDBSCAN
+    HAVE_CUML = True
+except Exception:
+    HAVE_CUML = False
+
+try:
+    from scipy.spatial import cKDTree as KDTree
+    from sklearn.neighbors import KDTree
+    HAVE_KDTREE = True
+except Exception:
+    KDTree = None
+    HAVE_KDTREE = False
+
 
 
 class Scene:
@@ -37,7 +61,7 @@ class Scene:
     gaussians : GaussianModel
 
     def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], mask_dir=None):
-        """b
+        """
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
@@ -87,6 +111,9 @@ class Scene:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(
                 scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False, mask_dir=mask_dir
             )
+            gs_camera_list = self.train_cameras[resolution_scale] 
+            self.gs_cameras = {Path(cam.image_name).stem: cam for cam in gs_camera_list}
+            
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(
                 scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True, mask_dir=mask_dir
@@ -120,7 +147,7 @@ class Scene:
     # --------------------------------------------------------------------------
     # NEW FUNCTION: load both trained model and COLMAP-seed Gaussian model
     # --------------------------------------------------------------------------
-    def load_with_colmap_seed(self, args: ModelParams, load_iteration=None, mask_dir=None):
+    def load_with_colmap_seed(self, args: ModelParams, load_iteration=None, mask_dir=None,num_its_BO=20,bo_optimize=False):
         """
         Loads both:
         - The trained Gaussian model (from .ply)
@@ -158,10 +185,120 @@ class Scene:
                 self.load_colmap()
             self.build_point_pixel_mapping()
 
-        # 4. Build instance-aware clusters from masks
+        # # 4. Build instance-aware clusters from masks
+        # if mask_dir is None:
+        #     raise RuntimeError("[Scene] mask_dir must be provided for instance-aware clustering")
+        # point_clusters = self.build_instance_seed_clusters(mask_dir)
+        # # Save raw mapping in the scene for debugging / visualization
+        # self.point_clusters = point_clusters  
+        # print(f"[DEBUG] COLMAP clusters: {point_clusters}")
+
+        # 4. Bayesian Optimization for clustering parameters
         if mask_dir is None:
             raise RuntimeError("[Scene] mask_dir must be provided for instance-aware clustering")
-        point_clusters = self.build_instance_seed_clusters(mask_dir)
+
+        if bo_optimize:
+            print("[Scene] Running Bayesian Optimization for instance clustering...")
+
+            # Precompute masks / overlaps / propagation ONCE
+            print("[Scene] Precomputing mask mappings and overlaps for BO (once)...")
+            mask_instances, point_to_masks, mask_to_points = masks_utils.compute_full_point_to_mask_instance_mapping(
+                self.points3D, self.images, mask_dir
+            )
+            overlaps = masks_utils.compute_mask_overlaps(point_to_masks, mask_to_points, min_shared=1, top_k=10**9,
+                                                        log=(print if False else (lambda *a, **k: None)))
+            multi_view_links = masks_utils.propagate_all_masks_gpu(
+                points3D=self.points3D,
+                images=self.images,
+                mask_instances=mask_instances,
+                gs_cameras=self.gs_cameras,
+                device="cuda"
+            )
+            precomputed = {
+                "mask_instances": mask_instances,
+                "point_to_masks": point_to_masks,
+                "mask_to_points": mask_to_points,
+                "overlaps": overlaps,
+                "multi_view_links": multi_view_links
+            }
+
+            # Wrap the BO objective with tqdm
+            progress_bar = tqdm(total=num_its_BO, desc="[Scene] BO iterations", leave=True)
+
+            def bo_objective(params):
+                jaccard_threshold, spatial_weight = params
+                clusters = self.build_instance_seed_clusters(
+                    mask_dir,
+                    device="cuda",
+                    jaccard_threshold=jaccard_threshold,
+                    spatial_consistency_weight=spatial_weight,
+                    refine_iters=1,
+                    verbose=False,
+                    precomputed=precomputed,
+                    reuse_precomputed=True
+                )
+
+                def get_xyz(pid):
+                    return np.asarray(self.points3D[pid].xyz, dtype=np.float32)[:3]
+
+                pids = [pid for pid in clusters.keys() if clusters[pid] != -1]
+                if len(pids) == 0:
+                    coherence = 1.0
+                else:
+                    X = np.vstack([get_xyz(pid) for pid in pids]).astype(np.float32)
+                    labels = np.array([clusters[pid] for pid in pids], dtype=int)
+                    from sklearn.neighbors import NearestNeighbors
+                    n_neighbors = min(8 + 1, X.shape[0])
+                    nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='kd_tree').fit(X)
+                    _, indices = nbrs.kneighbors(X)
+                    coherences = []
+                    for i, neigh_idx in enumerate(indices):
+                        neigh_idx = neigh_idx[1:]
+                        same = (labels[neigh_idx] == labels[i])
+                        coherences.append(np.mean(same))
+                    coherence = float(np.mean(coherences))
+
+                # Geometric compactness penalty (avg cluster radius)
+                clusters_xyz = defaultdict(list)
+                pid_to_idx = {pid:i for i,pid in enumerate(pids)}
+                for pid, cid in clusters.items():
+                    if cid == -1: continue
+                    clusters_xyz[cid].append(X[pid_to_idx[pid]])
+                if len(clusters_xyz) == 0:
+                    avg_radius = 0.0
+                else:
+                    avg_radius = np.mean([np.mean(np.linalg.norm(np.stack(pts) - np.mean(np.stack(pts), axis=0), axis=1)) for pts in clusters_xyz.values()])
+
+                score = coherence  # or coherence - 0.2*avg_radius
+                progress_bar.update(1)  # update tqdm bar for each BO iteration
+                return -score
+
+            res = gp_minimize(
+                bo_objective,
+                dimensions=[(0.01, 0.1), (0.5, 2.0)],  # jaccard_threshold, spatial_weight
+                n_calls=num_its_BO,
+                random_state=42
+            )
+
+            progress_bar.close()
+
+            best_jaccard, best_spatial = res.x
+            print(f"[Scene] BO result: jaccard_threshold={best_jaccard:.3f}, spatial_weight={best_spatial:.3f}")
+
+            # Build clusters with best parameters
+            point_clusters = self.build_instance_seed_clusters(
+                mask_dir,
+                device="cuda",
+                jaccard_threshold=best_jaccard,
+                spatial_consistency_weight=best_spatial,
+                refine_iters=100,
+                verbose=True
+            )
+        else:
+            point_clusters = self.build_instance_seed_clusters(mask_dir)
+
+        self.point_clusters = point_clusters
+        # print(f"[DEBUG] COLMAP clusters: {point_clusters}")
 
         # 5. Create GaussianModel from COLMAP point cloud
         print("[Scene] Creating GaussianModel from COLMAP point cloud (cluster seed)...")
@@ -173,24 +310,37 @@ class Scene:
         )
 
         # 6. Map COLMAP points to corresponding Gaussians
-        # Use the COLMAP point IDs from loaded COLMAP model
-        colmap_pids = list(self.points3D.keys())
-        colmap_pid_to_idx = {pid: idx for idx, pid in enumerate(colmap_pids)}
+        # print("[DEBUG] Mapping COLMAP point IDs to Gaussian indices...")
 
-        gaussian_clusters = torch.full((seed_gaussians._xyz.shape[0],), -1, dtype=torch.long)
-        for pid, cid in point_clusters.items():
-            if pid in colmap_pid_to_idx:
-                idx = colmap_pid_to_idx[pid]
-                gaussian_clusters[idx] = cid
+        colmap_pids = list(point_clusters.keys())  # point_clusters computed earlier
+        colmap_xyz = torch.stack([
+            torch.tensor(self.points3D[pid].xyz, dtype=torch.float32)
+            for pid in colmap_pids
+        ], dim=0).to(seed_gaussians._xyz.device)  # [M,3]
 
-        # Attach cluster IDs to the Gaussian model
+        colmap_cids = torch.tensor([point_clusters[pid] for pid in colmap_pids],
+                                dtype=torch.long, device=seed_gaussians._xyz.device)  # [M]
+
+        gaussian_xyz = seed_gaussians._xyz  # [N,3]
+
+        # Compute squared distances [N, M]
+        dists = torch.cdist(gaussian_xyz, colmap_xyz, p=2)  # [N, M]
+
+        # Find nearest COLMAP point for each Gaussian
+        nearest_idx = torch.argmin(dists, dim=1)  # [N]
+
+        # Assign Gaussian cluster IDs
+        gaussian_clusters = colmap_cids[nearest_idx]  # [N]
+
+        # Attach cluster IDs to Gaussian model
         seed_gaussians.cluster_ids = gaussian_clusters
         self.seed_gaussian_clusters = gaussian_clusters
 
+        # Debug info
         num_assigned = (gaussian_clusters >= 0).sum().item()
-        print(f"[Scene] Assigned {num_assigned} clusters to COLMAP Gaussians.")
-        num_clusters = len(torch.unique(gaussian_clusters[gaussian_clusters >= 0]))
-        print(f"[Scene] Total {num_clusters} unique clusters assigned.")
+        num_unique = len(torch.unique(gaussian_clusters))
+        print(f"[Scene] Assigned all {gaussian_xyz.shape[0]} Gaussians using nearest COLMAP point")
+        print(f"[Scene] Total {num_unique} unique clusters: {torch.unique(gaussian_clusters).tolist()}")
 
         # 7. Load trained Gaussian model if available
         trained_gaussians = None
@@ -354,182 +504,228 @@ class Scene:
     # ------------------------------------------------------------
     # NEW FUNCTION: build instance-aware COLMAP seed clusters
     # ------------------------------------------------------------
-    def build_instance_seed_clusters(self, mask_dir, device="cuda", save_path=None):
+    # -------------------------
+    # Build clusters with BO-tunable params
+    # -------------------------
+    # ---------- build_instance_seed_clusters (updated) ----------
+    def build_instance_seed_clusters(
+        self,
+        mask_dir,
+        device="cuda",
+        jaccard_threshold=0.01,
+        spatial_consistency_weight=0.5,
+        min_shared=1,
+        refine_iters=50,
+        verbose=False,
+        precomputed=None,
+        reuse_precomputed=True
+    ):
         """
-        Build initial Gaussian cluster seeds based on mask instances.
-
-        Args:
-            mask_dir (str): Folder containing *_instance_*.png masks.
-            device (str): Torch device for masks.
-            save_path (str): Optional path to save JSON cluster mapping.
-
-        Returns:
-            dict: point_id -> cluster_id
+        Build global instance clusters. If `precomputed` dict is provided and reuse_precomputed=True,
+        expensive mappings/overlaps/propagation will be re-used (required for efficient BO).
         """
-        
+        # ---------- Step 0: mask-point mappings (cache-aware) ----------
+        if precomputed is not None and reuse_precomputed:
+            mask_instances = precomputed.get("mask_instances", None)
+            point_to_masks = precomputed.get("point_to_masks", None)
+            mask_to_points = precomputed.get("mask_to_points", None)
+            overlaps = precomputed.get("overlaps", None)
+            multi_view_links = precomputed.get("multi_view_links", None)
+            if verbose:
+                print("[Scene] Using precomputed mask mappings/overlaps.")
+        else:
+            mask_instances, point_to_masks, mask_to_points = masks_utils.compute_full_point_to_mask_instance_mapping(
+                self.points3D, self.images, mask_dir
+            )
+            overlaps = None
+            multi_view_links = None
 
-        if not hasattr(self, "point_to_pixels"):
-            raise RuntimeError("[Scene] Run build_point_pixel_mapping() first.")
+        self.mask_instances = mask_instances
+        self._cached_point_to_masks = point_to_masks
+        self._cached_mask_to_points = mask_to_points
 
-        #Load all mask instances (vectorized)
-        mask_cache = {}  # frame_name -> tensor [N_instances, H, W]
-        for mask_file in tqdm(sorted(glob.glob(os.path.join(mask_dir, "*_instance_*.png"))),
-                            desc="[Scene] Loading instance masks"):
-            basename = Path(mask_file).stem.rsplit("_instance_", 1)[0]
-            if basename not in mask_cache:
-                mask_cache[basename] = []
-
-            mask = Image.open(mask_file).convert("L")
-            mask_tensor = torch.from_numpy(np.array(mask, dtype=np.float32)/255.0).to(device)
-            mask_cache[basename].append(mask_tensor)
-
-        # Convert lists to stacked tensors
-        for basename in mask_cache:
-            mask_cache[basename] = torch.stack(mask_cache[basename], dim=0)  # [N_instances, H, W]
-
-                # mask_cache: dict[frame_name] -> tensor[N_instances, H, W]
-        self.mask_instances = [mask_cache[k] for k in sorted(mask_cache.keys())]  # list of tensors
-        self.num_mask_instances = max([m.shape[0] for m in mask_cache.values()])  # max number of instances across frames
-
-        #Assign points to mask instances
-        point_to_instance = {}
-        instance_to_points = defaultdict(list)
-
-        for pid, observations in tqdm(self.point_to_pixels.items(), desc="[Scene] Assigning points to mask instances"):
-            votes = {}
-            for obs in observations:
-                frame_name = Path(obs["image_name"]).stem
-                xy = obs["xy"]
-                if frame_name not in mask_cache:
-                    continue
-                masks = mask_cache[frame_name]  # [N_instances, H, W]
-                x, y = int(round(xy[0])), int(round(xy[1]))
-                # Clamp pixel coordinates
-                x = max(0, min(x, masks.shape[2]-1))
-                y = max(0, min(y, masks.shape[1]-1))
-                # Which instances cover this pixel?
-                instance_hits = (masks[:, y, x] > 0.5).nonzero(as_tuple=False).squeeze(-1).cpu().numpy()
-                for iid in instance_hits:
-                    votes[iid] = votes.get(iid, 0) + 1
-
-            if votes:
-                # Assign to instance with most votes
-                assigned_instance = max(votes, key=votes.get)
-                point_to_instance[pid] = assigned_instance
-                instance_to_points[assigned_instance].append(pid)
-            else:
-                # Assign singleton cluster for points not seen in any mask
-                point_to_instance[pid] = -1
-                instance_to_points[-1].append(pid)
-
-        #Merge clusters transitively (if A↔1, B↔1, C↔B → A,B,C same cluster)
-        # Here a simple union-find can vectorize the merging
+        # ---------- Step 1: overlaps (cache-aware) ----------
+        if overlaps is None:
+            overlaps = masks_utils.compute_mask_overlaps(point_to_masks, mask_to_points, min_shared=min_shared, top_k=10**9, log=(print if verbose else (lambda *a, **k: None)))
+        # ---------- Step 2: derive merged groups under current jaccard_threshold ----------
         parent = {}
-        def find(x):
+        def find_m(x):
             parent.setdefault(x, x)
             if parent[x] != x:
-                parent[x] = find(parent[x])
+                parent[x] = find_m(parent[x])
             return parent[x]
-        def union(x, y):
-            parent[find(x)] = find(y)
+        def union_m(a, b):
+            ra, rb = find_m(a), find_m(b)
+            if ra != rb:
+                parent[rb] = ra
 
-        # Union points that share the same instance
-        for pts in instance_to_points.values():
-            if len(pts) > 1:
-                base = pts[0]
-                for p in pts[1:]:
-                    union(base, p)
+        for a, b, shared, jaccard_val, sA, sB in overlaps:
+            if jaccard_val >= jaccard_threshold:
+                union_m(a, b)
 
-        # Assign cluster IDs
+        all_masks = set(mask_to_points.keys())
+        groups = defaultdict(list)
+        for m in all_masks:
+            groups[find_m(m)].append(m)
+        merged_groups = [sorted(g) for g in groups.values() if len(g) > 1]
+        if verbose:
+            print(f"[INFO] Found {len(merged_groups)} merge candidate groups with jaccard >= {jaccard_threshold}")
+
+        # ---------- Step 3: optionally run heavy propagation if not precomputed ----------
+        if multi_view_links is None:
+            multi_view_links = masks_utils.propagate_all_masks_gpu(
+                points3D=self.points3D,
+                images=self.images,
+                mask_instances=self.mask_instances,
+                gs_cameras=self.gs_cameras,
+                device=device
+            )
+        self._cached_multi_view_links = multi_view_links
+
+        # ---------- Step 4: initial point->instance assignment ----------
+        point_to_instance = {}
+        for pid, masks in point_to_masks.items():
+            point_to_instance[pid] = masks[0] if masks else -1
+
+        # ---------- Step 5: union merged_groups into root mapping ----------
+        # Build union-find over instances using merged_groups (re-using parent map)
+        # Note: parent already set by previous union_m calls, but ensure every mask key is present
+        for m in mask_to_points.keys():
+            parent.setdefault(m, m)
+        # Now point->root -> cluster ids
         clusters = {}
         cluster_id_map = {}
         cid = 0
-        for pid in point_to_instance.keys():
-            root = find(pid)
+        def find_root_inst(inst):
+            parent.setdefault(inst, inst)
+            return find_m(inst)
+
+        for pid, inst in point_to_instance.items():
+            if inst == -1:
+                clusters[pid] = -1
+                continue
+            root = find_root_inst(inst)
             if root not in cluster_id_map:
                 cluster_id_map[root] = cid
                 cid += 1
             clusters[pid] = cluster_id_map[root]
 
-        print(f"[Scene] Built {len(set(clusters.values()))} initial instance-aware seed clusters")
+        self.point_clusters = clusters
 
-        # Optionally save to JSON
-        if save_path:
-            save_path = Path(save_path)
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(save_path, "w") as f:
-                json.dump(clusters, f, indent=2)
-            print(f"[Scene] Saved instance seed clusters to {save_path}")
+        # Step 6: refine clusters using supplied spatial_consistency_weight
+        refine_clusters_with_metric(
+            self,
+            max_iters=refine_iters,
+            w_geom=spatial_consistency_weight,
+            w_coh=1.0,
+            w_size=0.5,
+            w_count=0.5,
+            alpha=1.0,
+            spatial_consistency_weight=spatial_consistency_weight
+        )
 
-        self.point_to_instance_cluster = clusters
-
-        cluster_counts = np.bincount(list(clusters.values()))
-        print(f"[Scene] Cluster sizes: {cluster_counts}")
-
-        return clusters
+        return self.point_clusters
 
 
-    # ------------------------------------------------
-    # NEW FUNCTION: build gaussian instance adjacency
-    # ------------------------------------------------
-    def build_gaussian_instance_adjacency(self, 
-                                      topK_contrib_indices,
-                                      mask_images,
-                                      num_gaussians,
-                                      num_mask_instances,
-                                      device="cuda"):
+    def build_gaussian_instance_adjacency(
+        self,
+        topK_contrib_indices,   # [N, C, K]
+        mask_images,            # list of C masks, each [I, H, W]
+        num_gaussians,
+        num_mask_instances,
+        device="cuda"
+    ):
         """
-        Fully vectorized construction of the sparse adjacency matrix A[gaussian_id, instance_id] = 1.
-
-        Args:
-            topK_contrib_indices: [N_gaussians, num_cameras, K] indices of pixels each Gaussian contributes to
-            mask_images: list of per-camera masks, each [N_instances, H, W]
-            num_gaussians: total number of Gaussians
-            num_mask_instances: total number of mask instances
-            device: torch device
+        Fully optimized + vectorized construction of adjacency:
+            A[g, inst] = 1  if Gaussian g touches instance inst.
         """
+        
 
-        N, num_cameras, K = topK_contrib_indices.shape
+        N, C, K = topK_contrib_indices.shape
+        topK = topK_contrib_indices.to(device)
 
-        gaussian_ids_all = []
-        instance_ids_all = []
+        # -----------------------------------------------
+        # Precompute global gaussian index lookup
+        # -----------------------------------------------
+        # gaussian_ids_flat = [0,0,..0, 1,1,...1, ..., N-1,N-1,..N-1] of length N*K
+        gaussian_ids_flat = (
+            torch.arange(N, device=device)
+            .unsqueeze(1)
+            .expand(N, K)
+            .reshape(-1)
+        )  # [N*K]
 
-        for cam_idx in range(num_cameras):
-            topK_cam = topK_contrib_indices[:, cam_idx, :]  # [N, K]
+        # Max total entries (upper bound, we filter invalid later)
+        max_entries = C * N * K
 
-            # Get mask for this camera
-            mask_cam = mask_images[cam_idx]  # [N_instances, H, W]
-            mask_flat = mask_cam.argmax(dim=0).reshape(-1)  # [H*W]
+        # Preallocate outputs (large, but avoids Python overhead)
+        gaussian_buffer = torch.empty(max_entries, dtype=torch.long, device=device)
+        instance_buffer = torch.empty(max_entries, dtype=torch.long, device=device)
+        write_pos = 0
 
-            # Flatten topK indices
-            topK_flat = topK_cam.reshape(-1)                # [N*K]
-            gaussian_ids = torch.arange(N, device=device).unsqueeze(1).expand(-1, K).reshape(-1)  # [N*K]
+        # -----------------------------------------------
+        # Process each camera
+        # -----------------------------------------------
+        for cam_idx in range(C):
+            # ---- mask preprocessing (vectorized) ----
+            mask_cam = mask_images[cam_idx].to(device)        # [I, H, W]
+            I, H, W = mask_cam.shape
 
-            # Gather instance IDs at topK pixel locations
-            instance_ids = mask_flat[topK_flat]
+            # instance_map[y,x] = instance_id (0 = background)
+            # argmax is OK and very fast in modern GPUs
+            instance_map = mask_cam.argmax(dim=0).reshape(-1)     # [H*W]
 
-            # Keep only valid pixels
-            valid = instance_ids > 0
-            gaussian_ids_all.append(gaussian_ids[valid])
-            instance_ids_all.append(instance_ids[valid].to(device))
+            # ---- gather all K indices for this camera ----
+            # topK_cam: [N,K]
+            topK_cam = topK[:, cam_idx, :].reshape(-1)            # [N*K]
 
-        # Concatenate all cameras
-        gaussian_ids_final = torch.cat(gaussian_ids_all)
-        instance_ids_final = torch.cat(instance_ids_all)
+            # Mask: valid pixel indices ∈ [0, H*W)
+            valid_pix = topK_cam >= 0
+            if not valid_pix.any():
+                continue
 
-        # Clamp instance IDs to valid range
+            topK_valid = topK_cam[valid_pix]                      # actual pixel IDs
+            gauss_valid = gaussian_ids_flat[valid_pix]            # matching Gaussian IDs
+
+            # ---- lookup instances at these pixel coords ----
+            inst_ids = instance_map[topK_valid]                   # [M]
+
+            # Filter background (0 is background)
+            keep = inst_ids > 0
+            if not keep.any():
+                continue
+
+            g_sel = gauss_valid[keep]
+            i_sel = inst_ids[keep]
+
+            # ---- write to preallocated buffer ----
+            n_sel = g_sel.numel()
+            gaussian_buffer[write_pos: write_pos+n_sel] = g_sel
+            instance_buffer[write_pos: write_pos+n_sel] = i_sel
+            write_pos += n_sel
+
+        # -----------------------------------------------
+        # Final slice
+        # -----------------------------------------------
+        gaussian_ids_final = gaussian_buffer[:write_pos]
+        instance_ids_final = instance_buffer[:write_pos]
+
+        # Clamp instance IDs
         instance_ids_final = instance_ids_final.clamp(0, num_mask_instances - 1)
 
-        # Build sparse adjacency matrix
-        indices = torch.stack([gaussian_ids_final, instance_ids_final], dim=0)  # [2, NNZ]
-        values = torch.ones(indices.shape[1], dtype=torch.float32, device=device)
+        # -----------------------------------------------
+        # Build sparse adjacency
+        # -----------------------------------------------
+        idx = torch.stack([gaussian_ids_final, instance_ids_final], dim=0)
+
+        vals = torch.ones(idx.shape[1], dtype=torch.float32, device=device)
+
         A = torch.sparse_coo_tensor(
-            indices,
-            values,
+            idx,
+            vals,
             size=(num_gaussians, num_mask_instances)
         ).coalesce()
 
         return A
-
 
 
