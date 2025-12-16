@@ -41,88 +41,120 @@ def debug_tensor(name, tensor):
 # -----------------------------
 # Initialize Gaussian Instances (COLMAP seeds -> gaussians)
 # -----------------------------
-def initialize_gaussian_instances(gaussians, colmap_points, colmap_cluster_ids, temperature=0.1, max_dist=0.05):
+def initialize_gaussian_instances(
+    gaussians,
+    colmap_points,
+    colmap_cluster_ids,
+    temperature=0.1,
+    max_dist=0.05,
+    batch_colmap=16384,
+):
     """
     Initialize Gaussian instance logits from COLMAP cluster seeds.
 
-    Inputs:
-        gaussians: GaussianModel (segmented)
-        colmap_points: FloatTensor [Nc,3] COLMAP points
-        colmap_cluster_ids: LongTensor [Nc] Cluster IDs
-        temperature: float Softmax temperature
-        max_dist: float Distance threshold for hard assignment
-
-    Outputs:
-        Updates gaussians.instance_logits [N_seg, G] and instance_ids [N_seg]
+    CPU-based NN assignment (OOM-safe).
     """
 
-    # Move everything to the same device as the Gaussian model
     device = gaussians.get_xyz.device
-    xyz = gaussians.get_xyz.to(device)
-    colmap_points = colmap_points.to(device)
-    colmap_cluster_ids = colmap_cluster_ids.to(device)
 
-    # Map COLMAP cluster IDs to a contiguous range [0, G-1]
-    unique_ids = torch.unique(colmap_cluster_ids)  # unique cluster IDs
-    G = unique_ids.numel()                          # number of clusters
-    id_map = torch.full((int(colmap_cluster_ids.max().item()) + 1,), -1, dtype=torch.long, device=device)
-    id_map[unique_ids] = torch.arange(G, device=device)
-    colmap_cluster_ids = id_map[colmap_cluster_ids]  # remap cluster IDs
+    # -------------------------------------------------
+    # Move data to CPU for NN search
+    # -------------------------------------------------
+    xyz_cpu = gaussians.get_xyz.detach().cpu()          # [N, 3]
+    colmap_xyz = torch.as_tensor(colmap_points, dtype=torch.float32).cpu()  # [Nc, 3]
+    colmap_ids = torch.as_tensor(colmap_cluster_ids, dtype=torch.long)
 
-    # Prepare instance fields in the Gaussian model
-    N = xyz.shape[0]  # number of Gaussians
+    N = xyz_cpu.shape[0]
+
+    # -------------------------------------------------
+    # Map COLMAP cluster IDs → contiguous [0, G-1]
+    # -------------------------------------------------
+    unique_ids, inv_ids = torch.unique(colmap_ids, return_inverse=True)
+    G = unique_ids.numel()
+    colmap_ids = inv_ids.to(device)
+
+    # -------------------------------------------------
+    # Nearest neighbor search (CPU, streamed)
+    # -------------------------------------------------
+    best_dist = torch.full((N,), float("inf"))
+    best_idx  = torch.full((N,), -1, dtype=torch.long)
+
+    with torch.no_grad():
+        for c0 in range(0, colmap_xyz.shape[0], batch_colmap):
+            c1 = min(c0 + batch_colmap, colmap_xyz.shape[0])
+            block = colmap_xyz[c0:c1]  # [B, 3]
+
+            # squared distances
+            d = (
+                (xyz_cpu[:, None, :] - block[None, :, :])
+                .pow(2)
+                .sum(dim=2)
+            )  # [N, B]
+
+            block_min, block_idx = d.min(dim=1)
+            better = block_min < best_dist
+
+            best_dist[better] = block_min[better]
+            best_idx[better]  = block_idx[better] + c0
+
+            del d
+
+    # Move NN results to GPU
+    best_dist = best_dist.sqrt().to(device)
+    best_idx  = best_idx.to(device)
+
+    # -------------------------------------------------
+    # Prepare Gaussian instance fields
+    # -------------------------------------------------
     gaussians.set_instance_fields(N, G, device)
 
-    # Compute pairwise distances between Gaussians and COLMAP points
-    d = torch.cdist(xyz, colmap_points)  # shape [N, Nc]
-    min_d, min_idx = d.min(dim=1)        # distance and index of closest COLMAP point for each Gaussian
-    closest_cluster = colmap_cluster_ids[min_idx]  # cluster ID of closest point
+    closest_cluster = colmap_ids[best_idx]  # [N]
 
-    # Initialize logits for instance assignments
+    # -------------------------------------------------
+    # Initialize logits
+    # -------------------------------------------------
     logits = torch.zeros((N, G), device=device)
 
-    # Hard assignment: assign fully to closest cluster if within max_dist
-    mask = min_d <= max_dist
-    logits[mask, closest_cluster[mask]] = 1.0
+    hard_mask = best_dist <= max_dist
+    logits[hard_mask, closest_cluster[hard_mask]] = 1.0
 
-    # Soft/uniform assignment for Gaussians too far from any COLMAP point
-    logits[~mask] = 1.0 / float(G)
+    # uniform fallback
+    logits[~hard_mask] = 1.0 / float(G)
 
-    # Apply temperature-scaled softmax to get probability distribution over instances
-    gaussians.instance_logits = torch.nn.Parameter(torch.softmax(logits / temperature, dim=1))
+    # temperature-scaled softmax
+    logits = torch.softmax(logits / temperature, dim=1)
 
-    # Hard assignment of each Gaussian to the cluster with highest probability
-    gaussians.instance_ids = torch.argmax(gaussians.instance_logits, dim=1).detach()
+    gaussians.instance_logits = torch.nn.Parameter(logits)
+    gaussians.instance_ids = logits.argmax(dim=1).detach()
 
 
-def compute_topK_contributors(scene, K=8, bg_color=(0, 0, 0)):
+
+def compute_topK_contributors(scene, K=8, bg_color=(0, 0, 0), CAM_BATCH=16):
     """
-    Fast version: Computes the top-K contributing pixels for each Gaussian
-    across all training cameras. No sorting, no Python Gaussian loops.
+    Memory-efficient version:
+    Computes top-K contributing pixels for each Gaussian across all cameras
+    using camera batching so GPU memory stays small.
 
     Outputs:
-        indices:   [N, C, K]  pixel indices (or -1)
-        opacities: [N, C, K]  contribution weights (1.0)
+        indices:   [N, C, K] on CPU
+        opacities: [N, C, K] on CPU
     """
     from gaussian_renderer import render
 
-    # ----------------------------------------
-    # Prepare scene / buffers
-    # ----------------------------------------
     gaussians = scene.gaussians
     N = gaussians.get_xyz.shape[0]
     cameras = scene.getTrainCameras()
     C = len(cameras)
     device = gaussians.get_xyz.device
 
-    topK_indices = -torch.ones((N, C, K), dtype=torch.long, device=device)
-    topK_opacities = torch.zeros((N, C, K), dtype=torch.float32, device=device)
+    # Store final outputs on CPU
+    topK_indices = -torch.ones((N, C, K), dtype=torch.int32, device="cpu")
+    topK_opacities = torch.zeros((N, C, K), dtype=torch.float32, device="cpu")
 
-    # insertion counters per camera
-    # insert_pos[camera][gaussian] = next free slot [0..K]
-    insert_pos = torch.zeros((C, N), dtype=torch.long, device=device)
+    # Insertion positions per camera (CPU)
+    insert_pos = torch.zeros((C, N), dtype=torch.long, device="cpu")
 
-    # Dummy render pipe
+    # Dummy pipe
     class _DummyPipe:
         debug = False
         antialiasing = False
@@ -132,103 +164,139 @@ def compute_topK_contributors(scene, K=8, bg_color=(0, 0, 0)):
     dummy_pipe = _DummyPipe()
     bg_col = torch.tensor(bg_color, dtype=torch.float32, device=device)
 
-    # ----------------------------------------
-    # Process each camera
-    # ----------------------------------------
-    for cam_idx, cam in enumerate(tqdm(cameras, desc="Computing top-K contributors")):
-        with torch.no_grad():
-            out = render(cam, gaussians, dummy_pipe, bg_col, contrib=True, K=K)
+    # Batch cameras to avoid GPU memory overflow
+    for cam_batch_start in range(0, C, CAM_BATCH):
+        cam_batch_end = min(cam_batch_start + CAM_BATCH, C)
+        cam_batch = cameras[cam_batch_start:cam_batch_end]
 
-        if out is None or ("contrib_indices" not in out) or (out["contrib_indices"] is None):
-            continue
+        for local_idx, cam in enumerate(
+            tqdm(cam_batch, desc=f"Top-K (cams {cam_batch_start}-{cam_batch_end})")
+        ):
+            cam_idx = cam_batch_start + local_idx
 
-        contrib = out["contrib_indices"]      # [H, W, K]
-        H, W, _ = contrib.shape
+            # AMP context (non-autocast)
+            with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
+                out = render(cam, gaussians, dummy_pipe, bg_col, contrib=True, K=K)
 
-        flat = contrib.view(-1, K)
-        valid_mask = flat >= 0
+            # Skip if render failed
+            if out is None or ("contrib_indices" not in out) or (out["contrib_indices"] is None):
+                continue
 
-        gauss_ids = flat[valid_mask].long()         # <-- FIX HERE
-        pixel_ids = valid_mask.nonzero(as_tuple=True)[0]
-        # Example:
-        # flat:
-        #     pixel 0: [ 4, -1, -1 ]
-        #     pixel 1: [ 4,  7, -1 ]
-        #
-        # valid_mask:
-        #     pixel 0: [1,0,0]
-        #     pixel 1: [1,1,0]
+            contrib = out["contrib_indices"]      # [H, W, K] on GPU
+            H, W, _ = contrib.shape
 
-        # ----------------------------------------
-        # Assign pixel → Gaussian Top-K
-        # ----------------------------------------
-        # insertion position per Gaussian for this camera
-        cam_insert = insert_pos[cam_idx]                  # [N]
+            flat = contrib.view(-1, K)
+            valid_mask = flat >= 0
 
-        # positions where this Gaussian will be inserted
-        pos = cam_insert[gauss_ids]                       # [M]
+            gauss_ids = flat[valid_mask].long()
+            pixel_ids = valid_mask.nonzero(as_tuple=True)[0]
 
-        # Only keep contributions where Gaussian has room (< K)
-        keep = pos < K
-        if not keep.any():
-            continue
+            cam_insert = insert_pos[cam_idx].to(device)
+            pos = cam_insert[gauss_ids]
+            keep = pos < K
+            if not keep.any():
+                del contrib, flat, valid_mask, gauss_ids, pixel_ids, cam_insert
+                torch.cuda.empty_cache()
+                continue
 
-        gid = gauss_ids[keep]         # Gaussian ids to write
-        pid = pixel_ids[keep]         # Pixel indices to write
-        ppos = pos[keep].clamp(max=K-1)
+            gid = gauss_ids[keep]
+            pid = pixel_ids[keep]
+            ppos = pos[keep].clamp(max=K-1)
 
-        # Scatter into output tensors
-        topK_indices[gid, cam_idx, ppos] = pid
-        topK_opacities[gid, cam_idx, ppos] = 1.0
+            # Move to CPU and scatter
+            gid_cpu, pid_cpu, ppos_cpu = gid.cpu(), pid.cpu(), ppos.cpu()
+            topK_indices[gid_cpu, cam_idx, ppos_cpu] = pid_cpu
+            topK_opacities[gid_cpu, cam_idx, ppos_cpu] = 1.0
 
-        # Advance counters
-        cam_insert[gid] += keep.sum(dim=0) * 0  # only increase selected ones
-        cam_insert[gid] = (cam_insert[gid] + 1).clamp(max=K)
+            # Update insertion positions
+            cam_insert_cpu = cam_insert.cpu()
+            cam_insert_cpu[gid_cpu] = (cam_insert_cpu[gid_cpu] + 1).clamp(max=K)
+            insert_pos[cam_idx] = cam_insert_cpu
 
-        # Store back
-        insert_pos[cam_idx] = cam_insert
+            # Clean GPU memory
+            del contrib, flat, valid_mask, gauss_ids, pixel_ids, gid, pid, ppos, cam_insert, out
+            torch.cuda.empty_cache()
 
     return {
         "indices": topK_indices,
         "opacities": topK_opacities,
     }
 
-
 # -----------------------------
 # Convert to pixel-centric responsibilities (vectorized)
 # -----------------------------
-def topK_to_responsibilities(topK_contrib):
+def topK_to_responsibilities(topK_contrib, batch_size=2_000_000):
     """
-    Converts top-K contributors (Gaussian->pixels) -> pixel-centric format:
-    r_point_idx, r_gauss_idx, r_vals (all tensors)
+    Memory-efficient version of topK_to_responsibilities().
+    Processes top-K (N,C,K) tensor in batches instead of flattening everything.
+
+    Returns:
+        r_point_idx, r_gauss_idx, r_vals   (all on CPU)
     """
-    indices, opac = topK_contrib["indices"], topK_contrib["opacities"]
-    device = indices.device
+    indices = topK_contrib["indices"].cpu()     # [N, C, K]
+    opac    = topK_contrib["opacities"].cpu()   # [N, C, K]
 
-    N_gauss, C, K = indices.shape
-    gauss_idx = torch.arange(N_gauss, device=device)[:, None, None].expand(-1, C, K)
-    
-    # Flatten
-    flat_idx = indices.reshape(-1)
-    flat_op = opac.reshape(-1)
-    flat_gauss = gauss_idx.reshape(-1)
+    N, C, K = indices.shape
 
-    # Keep only valid pixel indices
-    mask = flat_idx >= 0
-    if mask.sum() == 0:
-        return (torch.empty(0, dtype=torch.long, device=device),
-                torch.empty(0, dtype=torch.long, device=device),
-                torch.empty(0, dtype=torch.float32, device=device))
+    # Precompute Gaussian ids
+    gauss_idx_full = (
+        torch.arange(N, dtype=torch.long).view(N, 1, 1)
+        .expand(N, C, K)
+        .reshape(-1)
+    )
 
-    r_point_idx = flat_idx[mask]
-    r_gauss_idx = flat_gauss[mask]
-    r_vals = flat_op[mask]
+    # Flatten ALL data ON CPU
+    flat_idx_full  = indices.reshape(-1)        # pixel idx or -1
+    flat_op_full   = opac.reshape(-1)
 
-    # Normalize per pixel using scatter_add
+    # Mask of valid contributions
+    valid = flat_idx_full >= 0
+    total_valid = valid.sum().item()
+    if total_valid == 0:
+        return (
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.float32),
+        )
+
+    # Final result containers (CPU)
+    r_point_idx_list = []
+    r_gauss_idx_list = []
+    r_vals_list      = []
+
+    # ----------- PROCESS IN CHUNKS -----------
+    # each chunk ~2M entries → safe for RAM/GPU
+    pos_array = torch.nonzero(valid, as_tuple=False).view(-1).split(batch_size)
+
+    for pos_chunk in pos_array:
+        # gather chunk
+        p_idx = flat_idx_full[pos_chunk]
+        g_idx = gauss_idx_full[pos_chunk]
+        vals  = flat_op_full[pos_chunk]
+
+        r_point_idx_list.append(p_idx)
+        r_gauss_idx_list.append(g_idx)
+        r_vals_list.append(vals)
+
+    # Concatenate final arrays
+    r_point_idx = torch.cat(r_point_idx_list, dim=0)
+    r_gauss_idx = torch.cat(r_gauss_idx_list, dim=0)
+    r_vals      = torch.cat(r_vals_list, dim=0)
+
+    # ----------- NORMALIZATION (BATCHED) -----------
+    # normalize per pixel (point index)
     uniq_pts, inv = torch.unique(r_point_idx, return_inverse=True)
-    denom = torch.zeros_like(uniq_pts, dtype=r_vals.dtype, device=device)
+
+    # denom per unique pixel
+    denom = torch.zeros_like(uniq_pts, dtype=torch.float32)
     denom.scatter_add_(0, inv, r_vals)
+
+    # final normalized responsibilities
     r_vals = r_vals / torch.clamp(denom[inv], min=1e-12)
+
+    # Clean up variables safely
+    del indices, opac, flat_idx_full, flat_op_full, gauss_idx_full
+    torch.cuda.empty_cache()
 
     return r_point_idx, r_gauss_idx, r_vals
 
@@ -236,101 +304,178 @@ def topK_to_responsibilities(topK_contrib):
 # -----------------------------
 # Compute full -> segmented Gaussian mapping (vectorized if possible)
 # -----------------------------
-def compute_full_to_seg_map(trained_gs_seg, full_model):
+def compute_full_to_seg_map(
+    trained_gs_seg,
+    full_model,
+    batch_seg=2048,
+    batch_full=16384,
+):
     """
-    Map full-resolution Gaussian indices -> segmented Gaussian indices.
+    CPU-based NN mapping (OOM-proof).
+    Uses streamed blocks, no large intermediate allocations.
     """
+    full_xyz = full_model.get_xyz.detach().cpu()        # [N_full, 3]
+    seg_xyz  = trained_gs_seg.get_xyz.detach().cpu()   # [N_seg, 3]
+
+    N_full = full_xyz.shape[0]
+    N_seg  = seg_xyz.shape[0]
+
+    kept_full = []
+
+    print("[map] Computing NN positions (CPU streamed)...")
+
+    # Precompute full-model squared norms once
+    full_norm = (full_xyz ** 2).sum(dim=1)   # [N_full]
+
+    # ---- tqdm over segmented Gaussians ----
+    seg_range = range(0, N_seg, batch_seg)
+    for s0 in tqdm(seg_range, desc="[map] Seg blocks", total=len(seg_range)):
+        s1 = min(s0 + batch_seg, N_seg)
+        seg_block = seg_xyz[s0:s1]           # [bs, 3]
+        bs = seg_block.shape[0]
+
+        # squared norms for seg block
+        seg_norm = (seg_block ** 2).sum(dim=1)  # [bs]
+
+        best_dist = torch.full((bs,), float("inf"))
+        best_idx  = torch.full((bs,), -1, dtype=torch.long)
+
+        # ---- streamed full-model blocks ----
+        for f0 in range(0, N_full, batch_full):
+            f1 = min(f0 + batch_full, N_full)
+            full_block = full_xyz[f0:f1]     # [bf, 3]
+
+            # dist^2 = ||x||^2 + ||y||^2 - 2 x·y
+            d = (
+                seg_norm[:, None]
+                + full_norm[f0:f1][None, :]
+                - 2.0 * (seg_block @ full_block.T)
+            )  # [bs, bf]
+
+            block_min_dist, block_min_pos = d.min(dim=1)
+
+            better = block_min_dist < best_dist
+            best_dist[better] = block_min_dist[better]
+            best_idx[better]  = block_min_pos[better] + f0
+
+            del d, full_block, block_min_dist, block_min_pos, better
+
+        kept_full.append(best_idx)
+
+        del seg_block, seg_norm, best_dist, best_idx
+
+    kept_full = torch.cat(kept_full)  # [N_seg]
+
+    # Move back to GPU only final outputs
     device = full_model.get_xyz.device
-    N_full, N_seg = full_model.get_xyz.shape[0], trained_gs_seg.get_xyz.shape[0]
+    kept_full = kept_full.to(device)
 
-    # If attribute exists, use it directly
-    if hasattr(trained_gs_seg, "full_res_indices") and trained_gs_seg.full_res_indices is not None:
-        kept_full = trained_gs_seg.full_res_indices.to(device).long()
-        method = "attribute: full_res_indices"
-    else:
-        method = "fallback_nn_positions"
-        full_xyz, seg_xyz = full_model.get_xyz.to(device), trained_gs_seg.get_xyz.to(device)
-        batch = 8192
-        ids = []
-        for start in range(0, N_seg, batch):
-            end = min(start + batch, N_seg)
-            d = torch.cdist(seg_xyz[start:end], full_xyz)
-            idx = d.argmin(dim=1)
-            ids.append(idx)
-        kept_full = torch.cat(ids).long()
+    full_to_seg = torch.full(
+        (N_full,), -1, dtype=torch.long, device=device
+    )
+    full_to_seg[kept_full] = torch.arange(N_seg, device=device)
 
-    if (kept_full < 0).any() or (kept_full >= N_full).any():
-        raise RuntimeError("kept_full contains invalid indices")
-
-    # Map full -> segmented
-    full_to_seg = torch.full((N_full,), -1, dtype=torch.long, device=device)
-    full_to_seg[kept_full] = torch.arange(kept_full.numel(), device=device)
-
-    print(f"[map] full_model N={N_full}, segmented N={N_seg}, method={method}")
-    print(f"[map] mapped kept_full count = {kept_full.numel()}, mapped full->seg hits = {(full_to_seg>=0).sum().item()}")
+    print(f"[map] Done. Mapped {N_seg} seg → {N_full} full.")
     return full_to_seg, kept_full
-
 
 # -----------------------------
 # Map full Top-K -> segmented Top-K (vectorized)
 # -----------------------------
-def map_full_topK_to_segmented(topK_full, full_to_seg, kept_full):
+def map_full_topK_to_segmented(topK_full, full_to_seg, kept_full, batch=4096):
     """
-    Map full-resolution top-K Gaussian contributors -> segmented top-K
+    Map full-model top-K contributions to segmented-model top-K.
+    Batched, memory-safe, device-consistent, OOM-proof.
+
+    Inputs:
+        topK_full: dict with "indices" [N_full, C, K] and "opacities"
+        full_to_seg: LongTensor [N_full] mapping full -> seg
+        kept_full: LongTensor [N_seg], indices of full Gaussians kept
+        batch: batch size for segmented Gaussians
+
+    Returns:
+        dict with "indices" and "opacities" for segmented Gaussians
     """
-    device = topK_full["indices"].device
-    topK_indices_full = topK_full["indices"][kept_full]      # [N_seg, C, K]
-    topK_opac_full = topK_full["opacities"][kept_full]      # [N_seg, C, K]
+    device = full_to_seg.device
+    topK_full_indices = topK_full["indices"]
+    topK_full_opac   = topK_full["opacities"]
 
-    # Map indices to segmented
-    mapped_indices = topK_indices_full.clone()
-    valid_mask = (mapped_indices >= 0) & (mapped_indices < full_to_seg.numel())
-    mapped_indices[valid_mask] = full_to_seg[mapped_indices[valid_mask]]
-    mapped_indices[~valid_mask] = -1
+    N_seg = kept_full.numel()
+    C, K = topK_full_indices.shape[1], topK_full_indices.shape[2]
 
-    # Zero out invalid opacities
-    topK_opac_full[mapped_indices < 0] = 0.0
+    # Preallocate outputs on CPU to be safe
+    mapped_indices = -torch.ones((N_seg, C, K), dtype=torch.long, device="cpu")
+    mapped_opac    = torch.zeros((N_seg, C, K), dtype=torch.float32, device="cpu")
 
-    # Debug
-    # print(f"[DEBUG] topK_seg['indices'] min={mapped_indices.min().item()}, max={mapped_indices.max().item()}")
-    # print(f"[DEBUG] topK_seg['opacities'] min={topK_opac_full.min().item()}, max={topK_opac_full.max().item()}")
-    valid_contribs = (mapped_indices >= 0).sum().item()
-    # print(f"[DEBUG] Segmented Gaussians with ≥1 contribution: {valid_contribs} / {kept_full.numel()}")
+    for s0 in range(0, N_seg, batch):
+        s1 = min(s0 + batch, N_seg)
+        batch_kept = kept_full[s0:s1].cpu()  # keep indices on CPU
 
-    return {"indices": mapped_indices, "opacities": topK_opac_full}
+        # Gather full topK for this batch
+        src_idx = topK_full_indices[batch_kept]  # [B, C, K]
+        src_op  = topK_full_opac[batch_kept]
+
+        # Map to segmented indices safely
+        # - clamp to valid range first
+        src_idx_clamped = src_idx.clone()
+        src_idx_clamped = torch.clamp(src_idx_clamped, 0, full_to_seg.numel() - 1)
+
+        seg_ids = full_to_seg[src_idx_clamped].cpu()  # map to seg, still CPU
+
+        # Set invalid mappings to -1
+        seg_ids[~(src_idx >= 0)] = -1
+        src_op_mapped = torch.where(seg_ids >= 0, src_op.cpu(), torch.zeros_like(src_op.cpu()))
+
+        # Write to preallocated outputs
+        mapped_indices[s0:s1] = seg_ids
+        mapped_opac[s0:s1] = src_op_mapped
+
+        # Free memory
+        del src_idx, src_op, src_idx_clamped, seg_ids, src_op_mapped
+        torch.cuda.empty_cache()
+
+    return {"indices": mapped_indices, "opacities": mapped_opac}
 
 
 # -----------------------------
 # Convert Gaussians -> pixels (vectorized version)
 # -----------------------------
-def convert_gauss_to_pixel_map(topK_full):
+def convert_gauss_to_pixel_map(topK_full, batch=2_000_000):
     """
-    Convert Gaussian->pixel top-K map to pixel->Gaussian mapping (vectorized).
+    Batched & memory-safe:
+    Converts Gaussian→pixel top-K into pixel→Gaussian list.
     """
-    indices = topK_full["indices"]
-    opacities = topK_full["opacities"]
-    device = indices.device
-    N_gauss, C, K = indices.shape
+    indices = topK_full["indices"].cpu()
+    op      = topK_full["opacities"].cpu()
 
-    # Flatten
+    N, C, K = indices.shape
+    gauss_idx_full = (
+        torch.arange(N, dtype=torch.long)[:, None, None]
+        .expand(N, C, K).reshape(-1)
+    )
+
     flat_idx = indices.reshape(-1)
-    flat_gauss = torch.arange(N_gauss, device=device)[:, None, None].expand(-1, C, K).reshape(-1)
-    flat_op = opacities.reshape(-1)
+    flat_op  = op.reshape(-1)
 
-    # Filter valid contributions
-    mask = (flat_idx >= 0) & (flat_op > 0)
-    flat_idx, flat_gauss = flat_idx[mask], flat_gauss[mask]
+    valid = (flat_idx >= 0) & (flat_op > 0)
+    pos_batches = torch.nonzero(valid, as_tuple=False).view(-1).split(batch)
 
-    # Build dictionary: pixel -> list of gaussians
-    pixel_to_gauss = {}
-    for pix, g in zip(flat_idx.tolist(), flat_gauss.tolist()):
-        pixel_to_gauss.setdefault(pix, []).append(g)
+    pixel_map = {}
 
-    # Flatten to list of tuples (tensor of gaussians, mask_val=1.0)
-    mappings = [(torch.tensor(glist, dtype=torch.long, device=device), 1.0)
-                for glist in pixel_to_gauss.values()]
+    for pos in pos_batches:
+        pidx = flat_idx[pos]
+        gidx = gauss_idx_full[pos]
 
-    print(f"[INFO] Converted {len(mappings)} pixels → Gaussians")
+        for p, g in zip(pidx.tolist(), gidx.tolist()):
+            if p not in pixel_map:
+                pixel_map[p] = [g]
+            else:
+                pixel_map[p].append(g)
+
+    # Convert dict → required list format
+    mappings = [(torch.tensor(glist, dtype=torch.long), 1.0)
+                for glist in pixel_map.values()]
+
+    print(f"[INFO] Pixel→Gaussian entries: {len(mappings)}")
     return mappings
 
 

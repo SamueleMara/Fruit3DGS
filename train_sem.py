@@ -43,7 +43,7 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, mask_dir=None, topk_contrib=8 ):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, mask_dir=None, topk_contrib=8, semantic_threshold=0.3):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -277,7 +277,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if is_last_iter and use_mask_filtering:
                 print(f"\n[ITER {iteration}] Filtering final point cloud using masks...")
-                filter_and_save(scene, mask_dir=mask_dir, iteration=iteration, K=topk_contrib)
+                filter_and_save(scene, mask_dir=mask_dir, iteration=iteration, K=topk_contrib, semantic_threshold=semantic_threshold)
 
 
 def prepare_output_and_logger(args):    
@@ -364,6 +364,8 @@ if __name__ == "__main__":
                     help="Path to folder containing binary masks for filtering the final point cloud")
     parser.add_argument("--topk_contrib", type=int, default=8,
                     help="Number of top contributors per pixel for filtering")
+    parser.add_argument("--sem_threshold", type=float, default=0.3,
+                    help="Number of top contributors per pixel for filtering")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -382,7 +384,8 @@ if __name__ == "__main__":
         args.test_iterations, args.save_iterations, args.checkpoint_iterations,
         args.start_checkpoint, args.debug_from,
         mask_dir=args.mask_dir,
-        topk_contrib=  args.topk_contrib
+        topk_contrib=args.topk_contrib,
+        semantic_threshold=args.sem_threshold
     )
 
     # All done

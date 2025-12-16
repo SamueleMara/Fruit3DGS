@@ -36,7 +36,7 @@ import torch
 from PIL import Image
 
 from scipy.spatial import cKDTree
-from sklearn.neighbors import KDTree
+from sklearn.neighbors import KDTree,NearestNeighbors
 from skopt import gp_minimize
 
 HAVE_CUML = False
@@ -67,6 +67,8 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+    
+        self.device =  args.data_device
 
         if load_iteration:
             if load_iteration == -1:
@@ -215,7 +217,9 @@ class Scene:
                 images=self.images,
                 mask_dir=mask_dir,
                 gs_cameras=self.gs_cameras_by_name,  # flattened dict: image_stem -> Camera
-                device="cuda"
+                device=self.device,
+                subset_frames=None,
+                point_to_pixels=self.point_to_pixels  
             )
 
             overlaps = masks_utils.compute_mask_overlaps(
@@ -242,7 +246,7 @@ class Scene:
                 jaccard_threshold, spatial_weight = params
                 clusters = self.build_instance_seed_clusters(
                     mask_dir,
-                    device="cuda",
+                    device=self.device,
                     jaccard_threshold=jaccard_threshold,
                     spatial_consistency_weight=spatial_weight,
                     refine_iters=1,
@@ -260,7 +264,6 @@ class Scene:
                 else:
                     X = np.vstack([get_xyz(pid) for pid in pids]).astype(np.float32)
                     labels = np.array([clusters[pid] for pid in pids], dtype=int)
-                    from sklearn.neighbors import NearestNeighbors
                     n_neighbors = min(8 + 1, X.shape[0])
                     nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='kd_tree').fit(X)
                     _, indices = nbrs.kneighbors(X)
@@ -301,7 +304,7 @@ class Scene:
             # Build clusters with best parameters
             point_clusters = self.build_instance_seed_clusters(
                 mask_dir,
-                device="cuda",
+                device=self.device,
                 jaccard_threshold=best_jaccard,
                 spatial_consistency_weight=best_spatial,
                 refine_iters=100,
@@ -367,10 +370,6 @@ class Scene:
                 print(f"[Scene] Loading trained Gaussian model from {trained_model_seg_path}")
                 trained_gaussians = GaussianModel(sh_degree=args.sh_degree)
                 trained_gaussians.load_ply(trained_model_seg_path, args.train_test_exp)
-                if trained_gaussians is not None:
-                    print(f"[OK] Scene initialized. Segmented Gaussians: {trained_gaussians.get_xyz.shape[0]}")
-                else:
-                    print(f"[OK] Scene initialized. No trained Gaussians loaded.")
 
 
         return trained_gaussians, seed_gaussians, scene_info
@@ -530,7 +529,7 @@ class Scene:
     def build_instance_seed_clusters(
         self,
         mask_dir,
-        device="cuda",
+        device=None,  # <-- added device argument
         jaccard_threshold=0.01,
         spatial_consistency_weight=0.5,
         min_shared=1,
@@ -544,17 +543,21 @@ class Scene:
         Heavy GPU propagation is computed only once per scene.
         """
 
+        # Use provided device or default to self.device
+        device = device or self.device
+
         # ---------- Step 0: decide which precomputed mapping to use ----------
         if precomputed is not None and reuse_precomputed:
             self._precomputed_masks = precomputed
         elif self._precomputed_masks is None:
-            # Compute heavy mappings once
             mask_instances, point_to_masks, mask_to_points, multi_view_links = masks_utils.compute_and_propagate_masks(
                 points3D=self.points3D,
                 images=self.images,
                 mask_dir=mask_dir,
                 gs_cameras=self.gs_cameras_by_name,  # flattened dict: image_stem -> Camera
-                device="cuda"
+                device=device,                        # use device here
+                subset_frames=None,
+                point_to_pixels=self.point_to_pixels  
             )
             overlaps = masks_utils.compute_mask_overlaps(
                 point_to_masks, mask_to_points, min_shared=min_shared, top_k=10**9,
@@ -569,8 +572,8 @@ class Scene:
             }
             if verbose:
                 print("[Scene] Precomputed mask mappings stored for reuse.")
-        
-        # Now use cached/precomputed
+
+        # Use cached/precomputed
         mask_instances = self._precomputed_masks["mask_instances"]
         point_to_masks = self._precomputed_masks["point_to_masks"]
         mask_to_points = self._precomputed_masks["mask_to_points"]
@@ -584,11 +587,17 @@ class Scene:
 
         # ---------- Step 1: merge groups based on Jaccard ----------
         parent = {}
+
+        def make_hashable(x):
+            return tuple(x) if isinstance(x, list) else x
+
         def find_m(x):
-            parent.setdefault(x, x)
-            if parent[x] != x:
-                parent[x] = find_m(parent[x])
-            return parent[x]
+            key = make_hashable(x)
+            parent.setdefault(key, key)
+            if parent[key] != key:
+                parent[key] = find_m(parent[key])
+            return parent[key]
+
         def union_m(a, b):
             ra, rb = find_m(a), find_m(b)
             if ra != rb:
@@ -602,6 +611,7 @@ class Scene:
         groups = defaultdict(list)
         for m in all_masks:
             groups[find_m(m)].append(m)
+
         merged_groups = [sorted(g) for g in groups.values() if len(g) > 1]
         if verbose:
             print(f"[INFO] Found {len(merged_groups)} merge candidate groups with jaccard >= {jaccard_threshold}")
@@ -611,7 +621,8 @@ class Scene:
 
         # ---------- Step 3: union merged groups ----------
         for m in mask_to_points.keys():
-            parent.setdefault(m, m)
+            parent.setdefault(make_hashable(m), make_hashable(m))
+
         clusters = {pid: -1 for pid in self.points3D.keys()}
         cluster_id_map = {}
         cid = 0
@@ -640,20 +651,20 @@ class Scene:
 
         return self.point_clusters
 
+
     def build_gaussian_instance_adjacency(
         self,
         topK_contrib_indices,   # [N, C, K]
         mask_images,            # list of C masks, each [I, H, W]
         num_gaussians,
-        num_mask_instances,
-        device="cuda"
+        num_mask_instances
     ):
         """
         Fully optimized + vectorized construction of adjacency:
             A[g, inst] = 1  if Gaussian g touches instance inst.
         """
         
-
+        device= self.device
         N, C, K = topK_contrib_indices.shape
         topK = topK_contrib_indices.to(device)
 
