@@ -8,7 +8,7 @@ from plyfile import PlyData
 def visualize_clusters_from_ply(ply_path):
     """
     Load a PLY saved by GaussianModel.save_clustered_ply() and visualize clusters.
-    Each cluster gets a unique color.
+    Each cluster gets a unique color. All negative cluster IDs (background) are skipped.
     """
     # -------------------------
     # Read PLY
@@ -24,6 +24,13 @@ def visualize_clusters_from_ply(ply_path):
         raise ValueError("PLY has no 'cluster_id' field. Make sure you saved clustered PLY.")
 
     cluster_ids = v['cluster_id'].astype(np.int32)
+
+    # -------------------------
+    # Filter out all negative cluster points (background)
+    # -------------------------
+    mask = cluster_ids > 1
+    xyz = xyz[mask]
+    cluster_ids = cluster_ids[mask]
 
     # -------------------------
     # Create Open3D point cloud
@@ -42,10 +49,9 @@ def visualize_clusters_from_ply(ply_path):
 
     # Expand to per-point color array
     colors = np.array([cluster_color_map[cid] for cid in cluster_ids], dtype=np.float32)
-
     pcd.colors = o3d.utility.Vector3dVector(colors)
 
-    print(f"[INFO] Visualizing {xyz.shape[0]} points across {len(unique_clusters)} clusters...")
+    print(f"[INFO] Visualizing {xyz.shape[0]} points across {len(unique_clusters)} clusters (excluding background).")
 
     # -------------------------
     # Show

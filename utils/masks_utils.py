@@ -110,163 +110,20 @@ def mask_area(mask_instances, frame_name, midx):
     info = get_mask_info(mask_instances, frame_name, midx)
     return info["area"] if info else 0
 
-# # ---------------- 3D -> Mask Mapping ---------------- #
-# def compute_full_point_to_mask_instance_mapping(points3D, images, mask_dir, downsample=1, save_path=None, device="cpu", log=print, batch_size=100000):
-#     """
-#     Compute full mapping from 3D points to mask instances, including all mask info, in one pass.
+def to_python(obj):
+    if isinstance(obj, dict):
+        return {to_python(k): to_python(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [to_python(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return [to_python(v) for v in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    else:
+        return obj
 
-#     Returns:
-#         mask_instances: dict[frame_name][midx] -> {centroid, bbox, area, mask_path}
-#         point_to_masks: dict[pid] -> list of (frame_name, midx)
-#         mask_to_points: dict[(frame_name, midx)] -> list of pids
-#     """
-
-#     device = torch.device(device)
-#     mask_dir = Path(mask_dir)
-#     mask_instances = {}
-#     sparse_masks = {}
-#     mask_shapes = {}
-
-#     # --- Step 1: Collect mask files with extension-insensitive check ---
-#     exts = ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
-#     exts += [e.upper() for e in exts]
-#     mask_files = []
-#     for f in mask_dir.iterdir():
-#         for ext in exts:
-#             if f.suffix.lower() == f".{ext.lower()}" and "_instance_" in f.stem:
-#                 mask_files.append(f)
-#                 break
-#     mask_files = sorted(mask_files)
-
-#     # --- Step 2: Precompute sparse masks and bounding boxes ---
-#     for mask_path in tqdm(mask_files, desc="[mask_utils] Precomputing mask instances"):
-#         frame_name, midx_str = mask_path.stem.rsplit("_instance_", 1)
-#         midx = int(midx_str)
-
-#         mask_img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-#         if downsample != 1:
-#             H, W = mask_img.shape
-#             mask_img = cv2.resize(mask_img, (W // downsample, H // downsample), interpolation=cv2.INTER_NEAREST)
-
-#         mask_bool = torch.tensor(mask_img > 0, dtype=torch.bool)
-#         if mask_bool.sum() == 0:
-#             continue
-
-#         ys, xs = torch.nonzero(mask_bool, as_tuple=True)
-#         cx, cy = float(xs.float().mean()), float(ys.float().mean())
-#         xmin, xmax = int(xs.min()), int(xs.max())
-#         ymin, ymax = int(ys.min()), int(ys.max())
-#         area = int(mask_bool.sum())
-
-#         mask_instances.setdefault(frame_name, {})[midx] = {
-#             "centroid": (cx, cy),
-#             "bbox": (xmin, ymin, xmax, ymax),
-#             "area": area,
-#             "mask_path": str(mask_path)
-#         }
-
-#         sparse_masks.setdefault(frame_name, {})[midx] = (xs + mask_bool.shape[1]*ys).to(device)
-#         mask_shapes[frame_name] = mask_bool.shape
-
-#     log(f"[INFO] Precomputed mask instances for {len(mask_instances)} frames")
-
-#     # --- Step 3: Organize points per frame ---
-#     point_img_map = defaultdict(list)
-#     pid_map = {}
-#     for pid, p in points3D.items():
-#         if not hasattr(p, 'image_ids') or not hasattr(p, 'point2D_idxs'):
-#             continue
-#         for img_id, pt2d_idx in zip(p.image_ids, p.point2D_idxs):
-#             if img_id not in images:
-#                 continue
-#             frame_name = Path(images[img_id].name).stem
-#             xys = np.array(getattr(images[img_id], "xys", []), dtype=float)
-#             if len(xys) == 0 or pt2d_idx >= len(xys):
-#                 continue
-#             u, v = xys[pt2d_idx]
-#             u_ds, v_ds = int(u / downsample), int(v / downsample)
-#             point_img_map[frame_name].append((pid, u_ds, v_ds))
-#             pid_map[pid] = None
-
-#     point_to_masks = defaultdict(list)
-#     mask_to_points = defaultdict(list)
-
-#     # --- Step 4: Mega-batch mapping per frame ---
-#     for frame_name, pts in tqdm(point_img_map.items(),
-#                                 desc="[mask_utils] Mapping points to masks (mega-batch)"):
-
-#         if frame_name not in sparse_masks:
-#             continue
-
-#         H, W = mask_shapes[frame_name]
-
-#         # Flattened uv for all points
-#         uvs = torch.tensor([u + W * v for _, u, v in pts], device=device)
-#         pids = torch.tensor([pid for pid, _, _ in pts], device=device)
-
-#         # Collect all mask indices for this frame
-#         mask_ids = list(sparse_masks[frame_name].keys())
-#         all_mask_indices = torch.cat([sparse_masks[frame_name][mid] for mid in mask_ids])
-
-#         # Offset table to map flattened position → mask id
-#         mask_offsets = torch.cumsum(
-#             torch.tensor([0] + [len(sparse_masks[frame_name][mid]) for mid in mask_ids[:-1]],
-#                          device=device),
-#             dim=0
-#         )
-
-#         # Process in batches to avoid OOM
-#         for i in range(0, len(uvs), batch_size):
-#             batch_uvs = uvs[i:i + batch_size]
-#             batch_pids = pids[i:i + batch_size]
-
-#             # membership test using broadcasting
-#             mask_matrix = batch_uvs[:, None] == all_mask_indices[None, :]
-#             hits = mask_matrix.any(dim=1)
-
-#             if not hits.any():
-#                 continue
-
-#             hit_idx = torch.nonzero(hits, as_tuple=False).flatten()
-
-#             for pid_i in hit_idx:
-#                 pid_val = batch_pids[pid_i].item()
-
-#                 # All matches for this point
-#                 hit_positions = torch.nonzero(
-#                     batch_uvs[pid_i] == all_mask_indices,
-#                     as_tuple=False
-#                 ).flatten()
-
-#                 if hit_positions.numel() == 0:
-#                     continue  # shouldn't happen but safe
-
-#                 # use ONLY the first match (all belong to same mask)
-#                 mask_pos = hit_positions[0].item()
-
-#                 # map mask_pos → mask index
-#                 midx_idx = torch.searchsorted(mask_offsets, mask_pos, right=True) - 1
-#                 midx = mask_ids[midx_idx]
-
-#                 point_to_masks[pid_val].append((frame_name, midx))
-#                 mask_to_points[(frame_name, midx)].append(pid_val)
-
-#     log(f"[INFO] Mapped {len(points3D)} points to {len(mask_to_points)} mask instances")
-
-#     # --- Step 5: Optional save ---
-#     if save_path:
-#         save_path = Path(save_path)
-#         os.makedirs(save_path.parent, exist_ok=True)
-#         serializable = {
-#             "mask_instances": mask_instances,
-#             "point_to_masks": {str(pid): [(f, midx) for f, midx in masks] for pid, masks in point_to_masks.items()},
-#             "mask_to_points": {f"{f}_{midx}": pids for (f, midx), pids in mask_to_points.items()}
-#         }
-#         with open(save_path, "w") as f:
-#             json.dump(serializable, f, indent=2)
-#         log(f"[INFO] Full mapping JSON saved to {save_path}")
-
-#     return mask_instances, point_to_masks, mask_to_points
 
 def load_full_mask_point_mapping(json_path, log=print):
     with open(json_path, "r") as f:
@@ -303,85 +160,6 @@ def parse_mapping_from_file(json_path):
         mask_to_points[(frame, int(midx))] = [int(p) for p in pids]
     return mask_instances, point_to_masks, mask_to_points
 
-def analyze_full_mapping(json_path=None, mask_instances=None, point_to_masks=None, mask_to_points=None, total_points=None, top_n=10, log=print):
-    """
-    Compute statistics and print a short report summarizing how points and mask_instances relate.
-    Provide either json_path or the three mapping dicts.
-    total_points: optional, total #3D points in COLMAP (to count unseen points)
-    """
-    if json_path is not None:
-        mask_instances, point_to_masks, mask_to_points = _parse_mapping_from_file(json_path)
-    assert mask_instances is not None and point_to_masks is not None and mask_to_points is not None
-
-    # Statistics: points
-    pts_with_masks = len(point_to_masks)
-    pts_mask_counts = [len(v) for v in point_to_masks.values()] if pts_with_masks else []
-    pts_multi_mask = sum(1 for c in pts_mask_counts if c > 1)
-    pts_single_mask = sum(1 for c in pts_mask_counts if c == 1)
-
-    if total_points is not None:
-        pts_unseen = total_points - pts_with_masks
-    else:
-        pts_unseen = None
-
-    # Statistics: masks
-    total_mask_instances = sum(len(v) for v in mask_instances.values())
-    mask_points_counts = []
-    for (f, midx), props in mask_instances.items():  # iterate frames then midx keys inconsistent types -> ignore here
-        pass
-    # Build counts from mask_to_points (this only includes masks that saw points)
-    mask_sizes = {k: len(v) for k, v in mask_to_points.items()}
-    masks_with_points = len(mask_sizes)
-    masks_without_points = total_mask_instances - masks_with_points
-
-    # Summaries
-    report = {}
-    report['total_mask_instances'] = total_mask_instances
-    report['masks_with_points'] = masks_with_points
-    report['masks_without_points'] = masks_without_points
-    report['points_with_masks'] = pts_with_masks
-    report['points_seen_by_multiple_masks'] = pts_multi_mask
-    report['points_seen_by_single_mask'] = pts_single_mask
-    report['points_unseen'] = pts_unseen
-
-    if pts_mask_counts:
-        report['pts_mask_counts_mean'] = float(np.mean(pts_mask_counts))
-        report['pts_mask_counts_median'] = float(np.median(pts_mask_counts))
-        report['pts_mask_counts_std'] = float(np.std(pts_mask_counts))
-        report['pts_mask_counts_p90'] = float(np.percentile(pts_mask_counts, 90))
-    else:
-        report.update({'pts_mask_counts_mean':0,'pts_mask_counts_median':0,'pts_mask_counts_std':0,'pts_mask_counts_p90':0})
-
-    if mask_sizes:
-        mask_size_vals = list(mask_sizes.values())
-        report['mask_points_mean'] = float(np.mean(mask_size_vals))
-        report['mask_points_median'] = float(np.median(mask_size_vals))
-        report['mask_points_std'] = float(np.std(mask_size_vals))
-        report['mask_points_p90'] = float(np.percentile(mask_size_vals, 90))
-    else:
-        report.update({'mask_points_mean':0,'mask_points_median':0,'mask_points_std':0,'mask_points_p90':0})
-
-    # Top examples
-    report['top_points_by_mask_count'] = sorted(((pid, len(v)) for pid, v in point_to_masks.items()), key=lambda x: -x[1])[:top_n]
-    report['top_masks_by_point_count'] = sorted(((k, len(v)) for k, v in mask_to_points.items()), key=lambda x: -x[1])[:top_n]
-
-    # Print readable summary
-    log("=== Full mapping analysis ===")
-    log(f"Mask instances total (from mask_instances.json): {total_mask_instances}")
-    log(f"Masks with points: {masks_with_points}    Masks without points: {masks_without_points}")
-    log(f"3D points with mask assignments: {pts_with_masks}    Points seen by >1 mask: {pts_multi_mask}")
-    if pts_unseen is not None:
-        log(f"3D points not seen by any mask: {pts_unseen}")
-    log(f"Points -> masks: mean={report['pts_mask_counts_mean']:.2f}, median={report['pts_mask_counts_median']:.2f}, p90={report['pts_mask_counts_p90']:.2f}")
-    log(f"Masks -> points: mean={report['mask_points_mean']:.2f}, median={report['mask_points_median']:.2f}, p90={report['mask_points_p90']:.2f}")
-    log("Top points by number of mask instances (pid, #masks):")
-    for pid, c in report['top_points_by_mask_count']:
-        log(f"  {pid}: {c}")
-    log("Top mask instances by number of points ((frame,midx), #points):")
-    for (frame, midx), c in report['top_masks_by_point_count']:
-        log(f"  {(frame, midx)}: {c}")
-
-    return report
 
 def compute_mask_overlaps(point_to_masks, mask_to_points, min_shared=1, top_k=200, log=print):
     """
@@ -625,273 +403,6 @@ def plot_mask_instance_points(points3D, images, mask_instances, mask_dir, output
 
             print(f"[OK] Saved: {out_path}")
 
-# def compute_and_propagate_masks(points3D, images, mask_dir, gs_cameras,
-#                                 downsample=1, batch_size=100000,
-#                                 device="cpu", save_path=None, log=print,
-#                                 subset_frames=None):
-#     """
-#     Full pipeline with caching:
-#       1) Check if JSON with previous computation exists in mask_dir → load and return
-#       2) Otherwise, compute masks, point_to_masks, mask_to_points, mapping
-#       3) Save JSON automatically in mask_dir
-
-#     Returns:
-#         mask_instances, point_to_masks, mask_to_points, mapping
-#     """
-#     device = torch.device(device)
-#     mask_dir = Path(mask_dir)
-    
-#     if save_path is None:
-#         json_path = mask_dir / "mask_mapping.json"
-#     else:
-#         json_path = Path(save_path)
-
-#     # ----------------- 0) Load cached JSON -----------------
-#     if json_path.exists():
-#         log(f"[INFO] Found cached JSON at {json_path}, loading...")
-#         with open(json_path, "r") as f:
-#             data = json.load(f)
-#         mask_instances = data.get("mask_instances", {})
-#         point_to_masks = {int(k): v for k, v in data.get("point_to_masks", {}).items()}
-#         mask_to_points = {}
-#         for k, v in data.get("mask_to_points", {}).items():
-#             f_name, m_id = k.rsplit("_", 1)
-#             mask_to_points[(f_name, int(m_id))] = v
-#         mapping = {}
-#         for k, v in data.get("mapping", {}).items():
-#             f_name, m_id = k.rsplit("_", 1)
-#             mapping[(f_name, int(m_id))] = v
-#         log("[INFO] Loaded cached masks and mapping.")
-#         return mask_instances, point_to_masks, mask_to_points, mapping
-
-#     # ----------------- 1) Load masks -----------------
-#     mask_instances = {}
-#     frame_masks = {}
-#     frame_mids = {}
-#     mask_shapes = {}
-
-#     exts = {"png","jpg","jpeg","bmp","tif","tiff"}
-#     exts |= {e.upper() for e in exts}
-#     mask_files = [f for f in mask_dir.iterdir() if "_instance_" in f.stem and f.suffix[1:] in exts]
-#     if len(mask_files) == 0:
-#         log("[WARN] No mask files found")
-#         return {}, defaultdict(list), defaultdict(list), defaultdict(list)
-
-#     frame_to_list = defaultdict(list)
-#     for f in mask_files:
-#         try:
-#             frame_name, midx_str = f.stem.rsplit("_instance_", 1)
-#             midx = int(midx_str)
-#         except:
-#             continue
-#         frame_to_list[frame_name].append((midx, f))
-
-#     # Limit subset if needed
-#     frame_names = list(frame_to_list.keys())
-#     if subset_frames is not None:
-#         if isinstance(subset_frames, int):
-#             frame_names = random.sample(frame_names, min(subset_frames, len(frame_names)))
-#         elif isinstance(subset_frames, str):
-#             frame_names = [subset_frames]
-#         else:
-#             frame_names = [f for f in frame_names if f in subset_frames]
-
-#     frame_to_list = {k: v for k, v in frame_to_list.items() if k in frame_names}
-
-#     # Load masks into CPU tensors (bool)
-#     for frame_name, mids_paths in tqdm(frame_to_list.items(), desc="[mask_utils] Loading masks"):
-#         imgs = []
-#         mids_order = []
-#         H = W = None
-#         for midx, fpath in mids_paths:
-#             img = cv2.imread(str(fpath), cv2.IMREAD_GRAYSCALE)
-#             if img is None: 
-#                 continue
-#             if H is None:
-#                 H, W = img.shape
-#             else:
-#                 img = cv2.resize(img, (W,H), interpolation=cv2.INTER_NEAREST)
-#             imgs.append(img)
-#             mids_order.append(midx)
-
-#             ys, xs = np.nonzero(img>0)
-#             if ys.size>0:
-#                 mask_instances.setdefault(frame_name, {})[midx] = {
-#                     "centroid": (float(xs.mean()), float(ys.mean())),
-#                     "bbox": (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
-#                     "area": int(ys.size),
-#                     "mask_path": str(fpath)
-#                 }
-
-#         if len(imgs)==0:
-#             continue
-
-#         mask_stack = torch.from_numpy(np.stack(imgs,0)>0)  # (M,H,W) bool
-#         frame_masks[frame_name] = mask_stack
-#         frame_mids[frame_name] = mids_order
-#         mask_shapes[frame_name] = (H,W)
-
-#     # ----------------- 2) Build point→image map -----------------
-#     point_img_map = defaultdict(list)
-#     pids = list(points3D.keys())
-#     for pid, p in points3D.items():
-#         if not hasattr(p,"image_ids") or not hasattr(p,"point2D_idxs"):
-#             continue
-#         for img_id, pt2d_idx in zip(p.image_ids, p.point2D_idxs):
-#             if img_id not in images:
-#                 continue
-#             img = images[img_id]
-#             frame_name = Path(img.name).stem
-#             xys = getattr(img,"xys", None)
-#             if xys is None or pt2d_idx>=len(xys):
-#                 continue
-#             u,v = xys[pt2d_idx]
-#             # Full resolution → scale=1
-#             u_scaled = int(round(u))
-#             v_scaled = int(round(v))
-#             H,W = mask_shapes[frame_name]
-#             # clamp to mask bounds
-#             u_scaled = min(max(u_scaled,0),W-1)
-#             v_scaled = min(max(v_scaled,0),H-1)
-#             point_img_map[frame_name].append((pid,u_scaled,v_scaled))
-
-#     # ----------------- 3) GPU gather: point→mask hits -----------------
-#     point_to_masks = defaultdict(list)
-#     mask_to_points = defaultdict(list)
-
-#     for frame_name, pts in tqdm(point_img_map.items(), desc="[mask_utils] GPU gather mapping"):
-#         if frame_name not in frame_masks: 
-#             continue
-#         mask_stack = frame_masks[frame_name].to(device)
-#         mids_order = frame_mids[frame_name]
-#         H,W = mask_shapes[frame_name]
-
-#         pids_np = np.array([p for p,_,_ in pts],dtype=np.int64)
-#         us_np = np.array([u for _,u,_ in pts],dtype=np.int64)
-#         vs_np = np.array([v for _,_,v in pts],dtype=np.int64)
-#         N = len(pids_np)
-
-#         for start in range(0,N,batch_size):
-#             end = min(N,start+batch_size)
-#             u_batch = torch.from_numpy(us_np[start:end]).to(device)
-#             v_batch = torch.from_numpy(vs_np[start:end]).to(device)
-#             p_batch = pids_np[start:end]
-
-#             hits = mask_stack[:, v_batch, u_batch]  # (M,B)
-#             nz = torch.nonzero(hits, as_tuple=False)
-#             if nz.numel()==0: 
-#                 continue
-#             for mask_idx, batch_idx in nz.cpu().numpy():
-#                 pid_val = int(p_batch[batch_idx])
-#                 mid_val = mids_order[mask_idx]
-#                 point_to_masks[pid_val].append((frame_name, mid_val))
-#                 mask_to_points[(frame_name, mid_val)].append(pid_val)
-
-#         del mask_stack
-#         torch.cuda.empty_cache()
-
-#     log(f"[INFO] Points mapped: {len(point_to_masks)}, masks: {len(mask_to_points)}")
-
-#     # ----------------- 4) Propagate points to other frames -----------------
-#     pid_to_idx = {pid:i for i,pid in enumerate(pids)}
-#     X_all = torch.tensor(np.stack([np.append(points3D[pid].xyz,1.0) for pid in pids]),dtype=torch.float32,device=device).T  # 4xN
-
-#     full_proj = {}
-#     for img in images.values():
-#         frame = Path(img.name).stem
-#         if frame not in gs_cameras:
-#             continue
-#         cam = gs_cameras[frame]
-#         full_proj[frame] = (cam.projection_matrix.to(device) @ cam.world_view_transform.to(device))
-
-#     points_in_masks = defaultdict(list)
-#     frame_point_idx_map = defaultdict(list)
-#     for pid, p in points3D.items():
-#         if not hasattr(p,"image_ids"): continue
-#         for img_id in p.image_ids:
-#             if img_id not in images: continue
-#             frame = Path(images[img_id].name).stem
-#             frame_point_idx_map[frame].append(pid_to_idx[pid])
-
-#     mapping = defaultdict(list)
-#     for frame_name, mask_stack_cpu in tqdm(frame_masks.items(), desc="[propagate] mapping"):
-#         if frame_name not in full_proj:
-#             continue
-#         mask_stack_gpu = mask_stack_cpu.to(device)
-#         H,W = mask_shapes[frame_name]
-#         idx_list = frame_point_idx_map.get(frame_name, [])
-#         if len(idx_list)==0: 
-#             continue
-#         idx_arr = np.array(idx_list,dtype=np.int64)
-#         for start in range(0,len(idx_arr),batch_size):
-#             chunk_idx = idx_arr[start:start+batch_size].tolist()
-#             X_sel = X_all[:, chunk_idx]
-#             proj = full_proj[frame_name] @ X_sel
-#             z = proj[2]
-#             u_t = torch.clamp((proj[0]/proj[2]).long(),0,W-1)
-#             v_t = torch.clamp((proj[1]/proj[2]).long(),0,H-1)
-#             valid = z>0
-#             inb = valid & (u_t>=0) & (u_t<W) & (v_t>=0) & (v_t<H)
-#             if not inb.any(): 
-#                 continue
-#             u_valid = u_t[inb]
-#             v_valid = v_t[inb]
-#             sel_idx = np.array(chunk_idx)[inb.cpu().numpy()]
-#             hits = mask_stack_gpu[:, v_valid, u_valid]
-#             nz = torch.nonzero(hits, as_tuple=False)
-#             for mask_idx, local_idx in nz.cpu().numpy():
-#                 pid_val = pids[sel_idx[local_idx]]
-#                 mid_val = frame_mids[frame_name][mask_idx]
-#                 points_in_masks[(frame_name, mid_val)].append(pid_val)
-#         del mask_stack_gpu
-#         torch.cuda.empty_cache()
-
-#     # ----------------- 5) Propagate to all destination frames -----------------
-#     src_items = list(points_in_masks.items())
-#     for (src_frame, src_mid), pid_list in tqdm(src_items, desc="[propagate] to dest frames"):
-#         if len(pid_list)==0: 
-#             continue
-#         indices = np.array([pid_to_idx[pid] for pid in pid_list],dtype=np.int64)
-#         for start in range(0,len(indices),batch_size):
-#             chunk = indices[start:start+batch_size].tolist()
-#             X_sel = X_all[:, chunk]
-#             for dst_frame, mask_stack_cpu in frame_masks.items():
-#                 if dst_frame not in full_proj: continue
-#                 H,W = mask_shapes[dst_frame]
-#                 mask_stack_gpu = mask_stack_cpu.to(device)
-#                 proj = full_proj[dst_frame] @ X_sel
-#                 u_t = torch.clamp((proj[0]/proj[2]).long(),0,W-1)
-#                 v_t = torch.clamp((proj[1]/proj[2]).long(),0,H-1)
-#                 valid = proj[2]>0
-#                 inb = valid & (u_t>=0) & (u_t<W) & (v_t>=0) & (v_t<H)
-#                 if not inb.any(): 
-#                     del mask_stack_gpu
-#                     continue
-#                 u_valid = u_t[inb]
-#                 v_valid = v_t[inb]
-#                 sel_idx = np.array(chunk)[inb.cpu().numpy()]
-#                 hits = mask_stack_gpu[:, v_valid, u_valid]
-#                 nz = torch.nonzero(hits, as_tuple=False)
-#                 for mask_idx, local_idx in nz.cpu().numpy():
-#                     pid_val = pids[sel_idx[local_idx]]
-#                     mid_val = frame_mids[dst_frame][mask_idx]
-#                     mapping[(src_frame, src_mid)].append((dst_frame, mid_val))
-#                 del mask_stack_gpu
-#                 torch.cuda.empty_cache()
-
-#     # ----------------- 6) Save JSON -----------------
-#     os.makedirs(json_path.parent, exist_ok=True)
-#     serializable = {
-#         "mask_instances": mask_instances,
-#         "point_to_masks": {str(pid): lst for pid,lst in point_to_masks.items()},
-#         "mask_to_points": {f"{f}_{m}": pids for (f,m),pids in mask_to_points.items()},
-#         "mapping": {f"{f}_{m}": dsts for (f,m),dsts in mapping.items()}
-#     }
-#     with open(json_path, "w") as f:
-#         json.dump(serializable,f,indent=2)
-#     log(f"[INFO] Saved JSON → {json_path}")
-
-#     return mask_instances, point_to_masks, mask_to_points, mapping
 
 def compute_and_propagate_masks(points3D, images, mask_dir, gs_cameras,
                                 point_to_pixels=None, downsample=1, batch_size=100000,
@@ -916,6 +427,9 @@ def compute_and_propagate_masks(points3D, images, mask_dir, gs_cameras,
     """
     device = torch.device(device)
     mask_dir = Path(mask_dir)
+
+    log(f"[DEBUG] Total COLMAP points: {len(points3D)}")
+    log(f"[DEBUG] Total images with masks on disk: {len(set(Path(f).stem.split('_instance_')[0] for f in mask_dir.iterdir()))}")
     
     if save_path is None:
         json_path = mask_dir / "mask_mapping.json"
@@ -940,7 +454,7 @@ def compute_and_propagate_masks(points3D, images, mask_dir, gs_cameras,
         log("[INFO] Loaded cached masks and mapping.")
         return mask_instances, point_to_masks, mask_to_points, mapping
 
-    # ----------------- 1) Load masks -----------------
+    # ----------------- 1) Load mask instances -----------------
     mask_instances = {}
     frame_masks = {}
     frame_mids = {}
@@ -949,6 +463,7 @@ def compute_and_propagate_masks(points3D, images, mask_dir, gs_cameras,
     exts = {"png","jpg","jpeg","bmp","tif","tiff"}
     exts |= {e.upper() for e in exts}
     mask_files = [f for f in mask_dir.iterdir() if "_instance_" in f.stem and f.suffix[1:] in exts]
+    log(f"[DEBUG] Found {len(mask_files)} mask instances files on disk")
     if len(mask_files) == 0:
         log("[WARN] No mask files found")
         return {}, defaultdict(list), defaultdict(list), defaultdict(list)
@@ -1009,7 +524,14 @@ def compute_and_propagate_masks(points3D, images, mask_dir, gs_cameras,
     # ----------------- 2) Build point→image map using point_to_pixels -----------------
     if point_to_pixels is None:
         raise RuntimeError("point_to_pixels must be provided or precomputed in Scene")
+    
+    # ---- DEBUG: point_to_pixels coverage ----
+    pts_with_obs = [pid for pid, obs in point_to_pixels.items() if len(obs) > 0]
+    log(f"[DEBUG] Points with at least one image observation: {len(pts_with_obs)} / {len(points3D)}")
 
+    pts_no_obs = len(points3D) - len(pts_with_obs)
+    if pts_no_obs > 0:
+        log(f"[WARN] Points with ZERO image observations: {pts_no_obs}")
 
     point_img_map = defaultdict(list)
     for pid, obs_list in point_to_pixels.items():
@@ -1017,56 +539,97 @@ def compute_and_propagate_masks(points3D, images, mask_dir, gs_cameras,
             frame_name = Path(obs["image_name"]).stem
             if frame_name not in mask_shapes:  # skip frames without masks
                 continue
-            u,v = obs["xy"]
             H,W = mask_shapes[frame_name]
-            u_scaled = min(max(int(round(u)),0), W-1)
-            v_scaled = min(max(int(round(v)),0), H-1)
+
+            u_float, v_float = obs["xy"]
+            u_scaled = int(round(u_float))
+            v_scaled = int(round(v_float))
+    
             point_img_map[frame_name].append((pid, u_scaled, v_scaled))
 
-    # ----------------- 3) GPU gather: point→mask hits -----------------
+    # ----------------- DEBUG: check coordinate scaling -----------------
+    total_proj = 0
+    out_of_bounds = 0
+    for frame_name, pts in point_img_map.items():
+        H,W = mask_shapes[frame_name]
+        for pid,u,v in pts:
+            total_proj += 1
+            if u<0 or u>=W or v<0 or v>=H:
+                out_of_bounds += 1
+    print(f"[DEBUG] Total projected points: {total_proj}, out-of-bounds: {out_of_bounds}")
+
+
+    # ----------------- DEBUG: frame coverage -----------------
+    total_proj = sum(len(v) for v in point_img_map.values())
+    unique_proj_pids = {pid for pts in point_img_map.values() for pid,_,_ in pts}
+
+    log(f"[DEBUG] Projections landing on frames with masks:")
+    log(f"        Total projections: {total_proj}")
+    log(f"        Unique points projected: {len(unique_proj_pids)} / {len(points3D)}")
+
+    missing = set(points3D.keys()) - unique_proj_pids
+    if len(missing) > 0:
+        log(f"[WARN] Points NEVER projected into any masked frame: {len(missing)}")
+
+
+    # ----------------- 3) Point → mask INSTANCE assignment (centroid-based) -----------------
     point_to_masks = defaultdict(list)
     mask_to_points = defaultdict(list)
 
-    for frame_name, pts in tqdm(point_img_map.items(), desc="[mask_utils] GPU gather mapping"):
-        if frame_name not in frame_masks: 
+    total_assignments = 0
+
+    for frame_name, pts in tqdm(point_img_map.items(),
+                                desc="[mask_utils] Instance assignment (centroid)"):
+
+        if frame_name not in mask_instances:
             continue
-        mask_stack = frame_masks[frame_name].to(device)
-        mids_order = frame_mids[frame_name]
-        H,W = mask_shapes[frame_name]
 
-        pids_np = np.array([p for p,_,_ in pts],dtype=np.int64)
-        us_np = np.array([u for _,u,_ in pts],dtype=np.int64)
-        vs_np = np.array([v for _,_,v in pts],dtype=np.int64)
-        N = len(pids_np)
+        insts = mask_instances[frame_name]   # mid -> dict with centroid, bbox, area
 
-        for start in range(0,N,batch_size):
-            end = min(N,start+batch_size)
-            u_batch = torch.from_numpy(us_np[start:end]).to(device)
-            v_batch = torch.from_numpy(vs_np[start:end]).to(device)
-            p_batch = pids_np[start:end]
+        if len(insts) == 0:
+            continue
 
-            hits = mask_stack[:, v_batch, u_batch]  # (M,B)
-            nz = torch.nonzero(hits, as_tuple=False)
-            if nz.numel()==0: 
-                continue
-            for mask_idx, batch_idx in nz.cpu().numpy():
-                pid_val = int(p_batch[batch_idx])
-                mid_val = mids_order[mask_idx]
-                point_to_masks[pid_val].append((frame_name, mid_val))
-                mask_to_points[(frame_name, mid_val)].append(pid_val)
+        # Pre-pack centroids
+        mids = list(insts.keys())
+        centroids = np.array(
+            [insts[mid]["centroid"] for mid in mids],
+            dtype=np.float32
+        )  # (M,2)
 
-        del mask_stack
-        torch.cuda.empty_cache()
+        for pid, u, v in pts:
+            du = centroids[:, 0] - u
+            dv = centroids[:, 1] - v
+            d2 = du * du + dv * dv
 
+            best_idx = int(np.argmin(d2))
+            best_mid = mids[best_idx]
+
+            point_to_masks[pid].append((frame_name, best_mid))
+            mask_to_points[(frame_name, best_mid)].append(pid)
+
+            total_assignments += 1
+
+    log(f"[INFO] Total instance assignments: {total_assignments}")
     log(f"[INFO] Points mapped: {len(point_to_masks)}, masks: {len(mask_to_points)}")
+
+    # ---- DEBUG: direct instance coverage ----
+    pts_with_direct_mask = set(point_to_masks.keys())
+    log(f"[DEBUG] Points with ≥1 DIRECT mask hit: "
+        f"{len(pts_with_direct_mask)} / {len(points3D)}")
+
+    missing_direct = set(points3D.keys()) - pts_with_direct_mask
+    if len(missing_direct) > 0:
+        log(f"[WARN] Points with NO direct mask hit: {len(missing_direct)}")
+
 
     # ----------------- 4) Propagate points to other frames (OOM-safe batches) -----------------
     pid_to_idx = {pid:i for i,pid in enumerate(points3D.keys())}
     pids = list(points3D.keys())
-    X_all = torch.tensor(np.stack([np.append(points3D[pid].xyz,1.0) for pid in pids]),dtype=torch.float32,device=device).T  # 4xN
+    X_all = torch.tensor(np.stack([np.append(points3D[pid].xyz,1.0) for pid in pids]),
+                        dtype=torch.float32, device=device).T  # 4xN
 
     full_proj = {frame: (cam.projection_matrix.to(device) @ cam.world_view_transform.to(device))
-                 for frame, cam in gs_cameras.items()}
+                for frame, cam in gs_cameras.items()}
 
     # Frame-wise point indices
     frame_point_idx_map = defaultdict(list)
@@ -1078,64 +641,98 @@ def compute_and_propagate_masks(points3D, images, mask_dir, gs_cameras,
     mapping = defaultdict(list)
     points_in_masks = defaultdict(list)
 
+    # First propagation: map points into masks in the same frame
     for frame_name, mask_stack_cpu in tqdm(frame_masks.items(), desc="[propagate] mapping"):
-        if frame_name not in full_proj: continue
-        mask_stack_gpu = mask_stack_cpu.to(device)
-        H,W = mask_shapes[frame_name]
-        idx_list = frame_point_idx_map.get(frame_name, [])
-        if len(idx_list)==0: 
+        if frame_name not in full_proj: 
             continue
-        idx_arr = np.array(idx_list,dtype=np.int64)
-        for start in range(0,len(idx_arr),batch_size):
+
+        mask_stack_gpu = mask_stack_cpu.to(device)  # (M,H,W)
+        H, W = mask_shapes[frame_name]
+        idx_list = frame_point_idx_map.get(frame_name, [])
+        if len(idx_list) == 0: 
+            continue
+
+        idx_arr = np.array(idx_list, dtype=np.int64)
+        for start in range(0, len(idx_arr), batch_size):
             chunk_idx = idx_arr[start:start+batch_size].tolist()
             X_sel = X_all[:, chunk_idx]
             proj = full_proj[frame_name] @ X_sel
-            u_t = torch.clamp((proj[0]/proj[2]).long(),0,W-1)
-            v_t = torch.clamp((proj[1]/proj[2]).long(),0,H-1)
-            valid = proj[2]>0
-            inb = valid & (u_t>=0) & (u_t<W) & (v_t>=0) & (v_t<H)
-            if not inb.any(): continue
-            u_valid = u_t[inb]
-            v_valid = v_t[inb]
-            sel_idx = np.array(chunk_idx)[inb.cpu().numpy()]
-            hits = mask_stack_gpu[:, v_valid, u_valid]
-            nz = torch.nonzero(hits, as_tuple=False)
-            for mask_idx, local_idx in nz.cpu().numpy():
+            u = torch.clamp((proj[0]/proj[2]).long(), 0, W-1)
+            v = torch.clamp((proj[1]/proj[2]).long(), 0, H-1)
+            valid = proj[2] > 0
+            inb = valid & (u>=0) & (u<W) & (v>=0) & (v<H)
+            if not inb.any(): 
+                continue
+
+            u_valid = u[inb]
+            v_valid = v[inb]
+            sel_idx = np.array(chunk_idx)[inb.cpu().numpy()]  # indices into pids
+
+            # hits: (num_masks, num_valid_points)
+            hits = mask_stack_gpu[:, v_valid, u_valid]  
+            M, B = hits.shape
+
+            # safe iteration
+            nz = torch.nonzero(hits, as_tuple=False)  # (mask_idx, point_idx)
+            for mask_idx_tensor, local_idx_tensor in nz:
+                mask_idx = int(mask_idx_tensor.item())
+                local_idx = int(local_idx_tensor.item())
                 pid_val = pids[sel_idx[local_idx]]
                 mid_val = frame_mids[frame_name][mask_idx]
                 points_in_masks[(frame_name, mid_val)].append(pid_val)
+
         del mask_stack_gpu
         torch.cuda.empty_cache()
+
+    # ---- DEBUG: propagation stats ----
+    propagated_pts = set()
+    for (_, _), pids_list in points_in_masks.items():
+        propagated_pts |= set(pids_list)
+
+    log(f"[DEBUG] Points recovered via propagation: {len(propagated_pts)}")
+    still_missing = set(points3D.keys()) - pts_with_direct_mask - propagated_pts
+    log(f"[DEBUG] Points still without ANY mask after propagation: {len(still_missing)}")
 
     # ----------------- 5) Propagate to all destination frames -----------------
     src_items = list(points_in_masks.items())
     for (src_frame, src_mid), pid_list in tqdm(src_items, desc="[propagate] to dest frames"):
-        if len(pid_list)==0: continue
-        indices = np.array([pid_to_idx[pid] for pid in pid_list],dtype=np.int64)
-        for start in range(0,len(indices),batch_size):
+        if len(pid_list) == 0: 
+            continue
+
+        indices = np.array([pid_to_idx[pid] for pid in pid_list], dtype=np.int64)
+        for start in range(0, len(indices), batch_size):
             chunk = indices[start:start+batch_size].tolist()
             X_sel = X_all[:, chunk]
+
             for dst_frame, mask_stack_cpu in frame_masks.items():
-                if dst_frame not in full_proj: continue
-                H,W = mask_shapes[dst_frame]
+                if dst_frame not in full_proj: 
+                    continue
+
                 mask_stack_gpu = mask_stack_cpu.to(device)
+                H, W = mask_shapes[dst_frame]
+
                 proj = full_proj[dst_frame] @ X_sel
-                u_t = torch.clamp((proj[0]/proj[2]).long(),0,W-1)
-                v_t = torch.clamp((proj[1]/proj[2]).long(),0,H-1)
-                valid = proj[2]>0
-                inb = valid & (u_t>=0) & (u_t<W) & (v_t>=0) & (v_t<H)
+                u = torch.clamp((proj[0]/proj[2]).long(), 0, W-1)
+                v = torch.clamp((proj[1]/proj[2]).long(), 0, H-1)
+                valid = proj[2] > 0
+                inb = valid & (u>=0) & (u<W) & (v>=0) & (v<H)
                 if not inb.any(): 
                     del mask_stack_gpu
                     continue
-                u_valid = u_t[inb]
-                v_valid = v_t[inb]
+
+                u_valid = u[inb]
+                v_valid = v[inb]
                 sel_idx = np.array(chunk)[inb.cpu().numpy()]
                 hits = mask_stack_gpu[:, v_valid, u_valid]
                 nz = torch.nonzero(hits, as_tuple=False)
-                for mask_idx, local_idx in nz.cpu().numpy():
+
+                for mask_idx_tensor, local_idx_tensor in nz:
+                    mask_idx = int(mask_idx_tensor.item())
+                    local_idx = int(local_idx_tensor.item())
                     pid_val = pids[sel_idx[local_idx]]
                     mid_val = frame_mids[dst_frame][mask_idx]
                     mapping[(src_frame, src_mid)].append((dst_frame, mid_val))
+
                 del mask_stack_gpu
                 torch.cuda.empty_cache()
 
@@ -1143,12 +740,16 @@ def compute_and_propagate_masks(points3D, images, mask_dir, gs_cameras,
     os.makedirs(json_path.parent, exist_ok=True)
     serializable = {
         "mask_instances": mask_instances,
-        "point_to_masks": {str(pid): lst for pid,lst in point_to_masks.items()},
-        "mask_to_points": {f"{f}_{m}": pids for (f,m),pids in mask_to_points.items()},
-        "mapping": {f"{f}_{m}": dsts for (f,m),dsts in mapping.items()}
+        "point_to_masks": {str(int(pid)): lst for pid, lst in point_to_masks.items()},
+        "mask_to_points": {f"{f}_{int(m)}": pids for (f, m), pids in mask_to_points.items()},
+        "mapping": {f"{f}_{int(m)}": dsts for (f, m), dsts in mapping.items()}
     }
+
+    serializable = to_python(serializable)
+
     with open(json_path, "w") as f:
-        json.dump(serializable,f,indent=2)
+        json.dump(serializable, f, indent=2)
+
     log(f"[INFO] Saved JSON → {json_path}")
 
     return mask_instances, point_to_masks, mask_to_points, mapping

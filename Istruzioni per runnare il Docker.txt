@@ -27,9 +27,9 @@ Primo:
 xhost +local:docker  # allow local Docker containers to use X11
 docker run -it \
   --gpus '"device=0"' \
-  --memory=64g \
-  --memory-swap=64g \
-  --shm-size=8g \
+  --memory=100g \
+  --memory-swap=100g \
+  --shm-size=100G \
   -e DISPLAY=$DISPLAY \
   -e XDG_RUNTIME_DIR=/tmp/runtime-$UID \
   -e QT_XCB_GL_INTEGRATION=xcb_egl \
@@ -46,9 +46,9 @@ Secondo:
 xhost +local:docker  # allow local Docker containers to use X11
 docker run -it \
   --gpus '"device=1"' \
-  --memory=64g \
-  --memory-swap=64g \
-  --shm-size=8g \
+  --memory=100g \
+  --memory-swap=100g \
+  --shm-size=100G \
   -e DISPLAY=$DISPLAY \
   -e XDG_RUNTIME_DIR=/tmp/runtime-$UID \
   -e QT_XCB_GL_INTEGRATION=xcb_egl \

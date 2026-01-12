@@ -83,7 +83,8 @@ def initialize_scene(colmap_dir, model_dir, mask_inst_dir, load_iteration=-1, nu
         load_iteration=load_iteration,
         mask_dir=mask_inst_dir,
         num_its_BO=num_its_BO,
-        bo_optimize=True
+        bo_optimize=True,
+        patience=10
     )
 
     print(f"[OK] Scene initialized. Segmented Gaussians: {trained_gs_seg.get_xyz.shape[0]}")
@@ -180,179 +181,196 @@ def train_clusters_dynamic_instance(scene, trained_gs_seg, colmap_seed, r_point_
 # -----------------------------
 # Spatially-Aware Score for Dense Clusters
 # -----------------------------
-def spatial_coherence_score(logits, ids, xyz):
+def spatial_coherence_score(
+    logits,
+    ids,
+    xyz,
+    block_size=2048,   # safe default (adjust if needed)
+):
     """
-    Compute a coherence-weighted spatial compactness score for clustered Gaussians.
+    Exact coherence-weighted spatial compactness score
+    using batched pairwise distances (OOM-safe).
     """
     device = xyz.device
-    coherence = torch.softmax(logits, dim=1)[torch.arange(len(ids), device=device), ids]
+    eps = 1e-8
+
+    coherence = torch.softmax(logits, dim=1)[
+        torch.arange(len(ids), device=device), ids
+    ]
 
     unique_ids = ids.unique()
     cluster_scores = []
 
     for cid in unique_ids:
         mask = ids == cid
-        if mask.sum() < 2:
-            continue  # skip singleton clusters
+        n = int(mask.sum())
+        if n < 2:
+            continue
 
-        cluster_xyz = xyz[mask]
-        cluster_coh = coherence[mask]
+        X = xyz[mask]                 # [n, 3]
+        w = coherence[mask]
+        w = w / (w.sum() + eps)       # normalize
 
-        # pairwise distances
-        diff = cluster_xyz[:, None, :] - cluster_xyz[None, :, :]
-        dists = torch.sqrt((diff ** 2).sum(-1) + 1e-8)
+        # precompute norms
+        X_norm = (X ** 2).sum(dim=1)  # [n]
 
-        # weighted intra-cluster distance
-        w = cluster_coh / cluster_coh.sum()
-        weighted_mean_dist = (dists * (w[:, None] @ w[None, :])).sum()
+        weighted_sum = 0.0
 
-        # normalize by cluster size
-        weighted_mean_dist /= mask.sum() ** 2
-        cluster_scores.append(1.0 / (weighted_mean_dist + 1e-6))  # higher = more compact
+        # ---- blockwise pairwise accumulation ----
+        for i0 in range(0, n, block_size):
+            i1 = min(i0 + block_size, n)
+            Xi = X[i0:i1]
+            wi = w[i0:i1]
+            ni = i1 - i0
+
+            Xi_norm = X_norm[i0:i1]
+
+            for j0 in range(0, n, block_size):
+                j1 = min(j0 + block_size, n)
+                Xj = X[j0:j1]
+                wj = w[j0:j1]
+
+                # ||x||^2 + ||y||^2 - 2 x·y
+                d2 = (
+                    Xi_norm[:, None]
+                    + X_norm[j0:j1][None, :]
+                    - 2.0 * (Xi @ Xj.T)
+                )
+
+                # numerical safety
+                d2 = torch.clamp(d2, min=0.0)
+                d = torch.sqrt(d2 + eps)
+
+                # weighted accumulation
+                weighted_sum += (d * (wi[:, None] * wj[None, :])).sum()
+
+        # normalize exactly like original
+        weighted_mean_dist = weighted_sum / (n * n)
+
+        cluster_scores.append(1.0 / (weighted_mean_dist + 1e-6))
 
     if len(cluster_scores) == 0:
         return 0.0
+
     return torch.stack(cluster_scores).mean().item()
-
-
-# -----------------------------
-# BO Dense Instance Cluster Optimization
-# -----------------------------
-def optimize_dense_instances(scene, trained_gs_seg, colmap_seed, r_point_idx, r_gauss_idx, r_vals,
-                             n_calls=20, iterations=100, lr=5e-4):
-    """
-    Bayesian Optimization over temperature, max_dist, and coherence threshold
-    for dense Gaussian clusters, keeping cluster assignments fixed and
-    favoring spatially compact clusters.
-    """
-
-    # BO search space
-    space = [
-        Real(0.01, 1.0, name='temperature'),
-        Real(0.001, 0.1, name='max_dist'),
-        Real(0.05, 0.9, name='coherence_threshold')
-    ]
-    opt = Optimizer(space, random_state=42)
-    best_score = -float('inf')
-    best_params = None
-
-    xyz_orig = trained_gs_seg.get_xyz.detach().cpu()
-    ids_fixed = trained_gs_seg.instance_ids.detach().cpu()
-
-
-    for i in tqdm(range(n_calls), desc="BO Dense Instance Clusters"):
-        temperature, max_dist, coherence_threshold = opt.ask()
-
-        # refine logits without modifying assignments
-        xyz_final, logits_final, _ = train_clusters_dynamic_instance(
-            scene, trained_gs_seg, colmap_seed,
-            r_point_idx, r_gauss_idx, r_vals,
-            iterations=iterations, lr=lr,
-            temperature=temperature, max_dist=max_dist,
-            debug=False
-        )
-
-        # spatially aware, coherence-weighted score
-        score = spatial_coherence_score(logits_final, ids_fixed, xyz_orig)
-
-        # maximize the score
-        opt.tell([temperature, max_dist, coherence_threshold], -score)
-
-        if score > best_score:
-            best_score = score
-            best_params = (temperature, max_dist, coherence_threshold)
-            best_logits = logits_final.clone().detach()
-
-    # Apply best parameters
-    best_temperature, best_max_dist, best_threshold = best_params
-    if best_params is None:
-        best_temperature = temperature
-        best_max_dist = max_dist
-        best_threshold = 0.0
-        print(
-            "[BO Dense] No valid parameter set found — "
-            f"using fallback: temperature={best_temperature:.3f}, "
-            f"max_dist={best_max_dist:.3f}, threshold={best_threshold:.2f}"
-        )
-    else:
-        best_temperature, best_max_dist, best_threshold = best_params
-        print(
-            f"[BO Dense] Best params: temperature={best_temperature:.3f}, "
-            f"max_dist={best_max_dist:.3f}, threshold={best_threshold:.2f}")
-
-    with torch.no_grad():
-        trained_gs_seg.instance_logits.copy_(best_logits)
-        trained_gs_seg.instance_ids.copy_(ids_fixed)  # keep IDs fixed
-
-    # Filter coherent Gaussians using optimized threshold
-    trained_gs_seg, mask_filt = cluster_utils.filter_coherent_gaussians(
-        trained_gs_seg, threshold=best_threshold
-    )
-
-    return best_params, trained_gs_seg
-
 
 # -----------------------------
 # BO Threshold Optimization Only
 # -----------------------------
-def optimize_threshold_only(trained_gs_seg, n_calls=50):
+def optimize_threshold_only(trained_gs_seg, n_calls=5,patience = 10):
     """
-    Bayesian Optimization to find the best coherence threshold for
-    already trained/fixed instance assignments.
+    Bayesian Optimization over coherence *quantile* instead of raw threshold.
+    This guarantees that some Gaussians always survive.
     """
 
-    space = [Real(0.05, 0.9, name='coherence_threshold')]
+    # ---------------------------------------------------------
+    # Precompute coherence distribution ONCE
+    # ---------------------------------------------------------
+    with torch.no_grad():
+        logits = trained_gs_seg.instance_logits.detach()
+        ids = trained_gs_seg.instance_ids.detach()
+        coherence_all = cluster_utils.compute_instance_coherence(logits, ids)
+
+    c_min = coherence_all.min().item()
+    c_max = coherence_all.max().item()
+
+    print(
+        f"[BO] Coherence stats: min={c_min:.6f}, max={c_max:.6f}, "
+        f"mean={coherence_all.mean().item():.6f}"
+    )
+
+    # ---------------------------------------------------------
+    # BO search space: quantile, not threshold
+    # ---------------------------------------------------------
+    # q = 0.9  → keep top 10% most coherent Gaussians
+    space = [Real(0.60, 0.98, name="coherence_quantile")]
     opt = Optimizer(space, random_state=42)
-    best_score = -float('inf')
+
+    best_score = -float("inf")
+    best_q = None
     best_threshold = None
+    no_improve_count = 0  # counter for patience
 
-    ids_fixed = trained_gs_seg.instance_ids.detach()
-    xyz = trained_gs_seg.get_xyz.detach()
+    # ---------------------------------------------------------
+    # BO loop
+    # ---------------------------------------------------------
+    for i in tqdm(range(n_calls), desc="BO Threshold (quantile-based)"):
+        [q] = opt.ask()
 
-    for i in tqdm(range(n_calls), desc="BO Threshold Only"):
-        [coherence_threshold] = opt.ask()
+        # Convert quantile -> actual threshold
+        threshold = torch.quantile(coherence_all, q).item()
 
-        # Filter the model with the current threshold
+        # Apply filtering
         filtered_model, mask = cluster_utils.filter_coherent_gaussians(
-            trained_gs_seg, threshold=coherence_threshold
+            trained_gs_seg, threshold=threshold
         )
 
-        # Skip thresholds that remove all Gaussians
-        if filtered_model.get_xyz.shape[0] == 0:
-            opt.tell([coherence_threshold], 1e6)  # very bad score
+        kept = mask.sum().item()
+        total = mask.numel()
+
+        # Safety check (should almost never trigger)
+        if kept == 0:
+            print(f"[BO {i:03d}] q={q:.3f} -> th={threshold:.6f} | kept=0 (SKIP)")
+            opt.tell([q], 1e6)
             continue
 
-        # Compute spatial coherence score on filtered model
+        # Compute score
         filtered_logits = filtered_model.instance_logits.detach()
         filtered_ids = filtered_model.instance_ids.detach()
         filtered_xyz = filtered_model.get_xyz.detach()
 
-        score = spatial_coherence_score(filtered_logits, filtered_ids, filtered_xyz)
+        score = spatial_coherence_score(
+            filtered_logits, filtered_ids, filtered_xyz
+        )
 
-        # maximize the score
-        opt.tell([coherence_threshold], -score)
+        opt.tell([q], -score)
 
+        print(
+            f"[BO {i:03d}] q={q:.3f} -> th={threshold:.6f} | "
+            f"kept={kept}/{total} ({100*kept/total:.2f}%) | "
+            f"score={score:.6f}"
+        )
+
+        # Check for improvement
         if score > best_score:
             best_score = score
-            best_threshold = coherence_threshold
+            best_q = q
+            best_threshold = threshold
+            no_improve_count = 0  # reset patience
+        else:
+            no_improve_count += 1
 
-    if best_threshold is None:
-        threshold=0.557
+        # Early stopping
+        if no_improve_count >= patience:
+            print(f"[BO] No improvement for {patience} iterations → stopping early at iteration {i}")
+            break
+
+    # ---------------------------------------------------------
+    # Fallback (should not happen, but safe)
+    # ---------------------------------------------------------
+    if best_q is None:
+        best_q = 0.9
+        best_threshold = torch.quantile(coherence_all, best_q).item()
         print(
             "[BO Coherence Threshold] No valid parameter set found — "
-            f"using fallback:best_threshold={threshold:.3f}"
-
+            f"fallback q={best_q:.3f}, threshold={best_threshold:.6f}"
         )
     else:
-        print(f"[BO Threshold Only] Best threshold: {best_threshold:.3f}")
-        threshold=best_threshold
-    
+        print(
+            f"[BO Threshold Only] Best q={best_q:.3f} "
+            f"(threshold={best_threshold:.6f})"
+        )
+
+    # ---------------------------------------------------------
     # Apply best threshold to the actual model
+    # ---------------------------------------------------------
     trained_gs_seg, _ = cluster_utils.filter_coherent_gaussians(
-        trained_gs_seg, threshold
+        trained_gs_seg, threshold=best_threshold
     )
 
     return best_threshold, trained_gs_seg
+
+
 
 
 
@@ -434,7 +452,7 @@ def main():
 
     # Compute Top-K per full-model Gaussian
     print("\n[Step] Computing top-K contributors on full model ...")
-    topK_full = cluster_utils.compute_topK_contributors(scene, K=8)
+    topK_full = cluster_utils.compute_topK_contributors(scene, K=1)
 
     # Build mapping full → segmented
     print("\n[Step] Computing full->seg mapping...")
@@ -480,7 +498,8 @@ def main():
     print("\n[Step] Running Bayesian Optimization to find best threshold...")
     best_threshold, trained_gs_seg = optimize_threshold_only(
         trained_gs_seg,
-        n_calls=args.bo_steps
+        n_calls=args.bo_steps,
+        patience = 10
     )
 
     # Save filtered PLY

@@ -1,5 +1,6 @@
 import os
 import glob
+import faiss
 import torch
 import numpy as np
 from PIL import Image
@@ -129,7 +130,7 @@ def initialize_gaussian_instances(
 
 
 
-def compute_topK_contributors(scene, K=8, bg_color=(0, 0, 0), CAM_BATCH=16):
+def compute_topK_contributors(scene, K=1, bg_color=(0, 0, 0), CAM_BATCH=16):
     """
     Memory-efficient version:
     Computes top-K contributing pixels for each Gaussian across all cameras
@@ -148,7 +149,7 @@ def compute_topK_contributors(scene, K=8, bg_color=(0, 0, 0), CAM_BATCH=16):
     device = gaussians.get_xyz.device
 
     # Store final outputs on CPU
-    topK_indices = -torch.ones((N, C, K), dtype=torch.int32, device="cpu")
+    topK_indices = -torch.ones((N, C, K), dtype=torch.long, device="cpu")
     topK_opacities = torch.zeros((N, C, K), dtype=torch.float32, device="cpu")
 
     # Insertion positions per camera (CPU)
@@ -304,79 +305,135 @@ def topK_to_responsibilities(topK_contrib, batch_size=2_000_000):
 # -----------------------------
 # Compute full -> segmented Gaussian mapping (vectorized if possible)
 # -----------------------------
+# def compute_full_to_seg_map(
+#     trained_gs_seg,
+#     full_model,
+#     batch_seg=2048,
+#     batch_full=16384,
+# ):
+#     """
+#     CPU-based NN mapping (OOM-proof).
+#     Uses streamed blocks, no large intermediate allocations.
+#     """
+#     full_xyz = full_model.get_xyz.detach().cpu()        # [N_full, 3]
+#     seg_xyz  = trained_gs_seg.get_xyz.detach().cpu()   # [N_seg, 3]
+
+#     N_full = full_xyz.shape[0]
+#     N_seg  = seg_xyz.shape[0]
+
+#     kept_full = []
+
+#     print("[map] Computing NN positions (CPU streamed)...")
+
+#     # Precompute full-model squared norms once
+#     full_norm = (full_xyz ** 2).sum(dim=1)   # [N_full]
+
+#     # ---- tqdm over segmented Gaussians ----
+#     seg_range = range(0, N_seg, batch_seg)
+#     for s0 in tqdm(seg_range, desc="[map] Seg blocks", total=len(seg_range)):
+#         s1 = min(s0 + batch_seg, N_seg)
+#         seg_block = seg_xyz[s0:s1]           # [bs, 3]
+#         bs = seg_block.shape[0]
+
+#         # squared norms for seg block
+#         seg_norm = (seg_block ** 2).sum(dim=1)  # [bs]
+
+#         best_dist = torch.full((bs,), float("inf"))
+#         best_idx  = torch.full((bs,), -1, dtype=torch.long)
+
+#         # ---- streamed full-model blocks ----
+#         for f0 in range(0, N_full, batch_full):
+#             f1 = min(f0 + batch_full, N_full)
+#             full_block = full_xyz[f0:f1]     # [bf, 3]
+
+#             # dist^2 = ||x||^2 + ||y||^2 - 2 x·y
+#             d = (
+#                 seg_norm[:, None]
+#                 + full_norm[f0:f1][None, :]
+#                 - 2.0 * (seg_block @ full_block.T)
+#             )  # [bs, bf]
+
+#             block_min_dist, block_min_pos = d.min(dim=1)
+
+#             better = block_min_dist < best_dist
+#             best_dist[better] = block_min_dist[better]
+#             best_idx[better]  = block_min_pos[better] + f0
+
+#             del d, full_block, block_min_dist, block_min_pos, better
+
+#         kept_full.append(best_idx)
+
+#         del seg_block, seg_norm, best_dist, best_idx
+
+#     kept_full = torch.cat(kept_full)  # [N_seg]
+
+#     # Move back to GPU only final outputs
+#     device = full_model.get_xyz.device
+#     kept_full = kept_full.to(device)
+
+#     full_to_seg = torch.full(
+#         (N_full,), -1, dtype=torch.long, device=device
+#     )
+#     full_to_seg[kept_full] = torch.arange(N_seg, device=device)
+
+#     print(f"[map] Done. Mapped {N_seg} seg → {N_full} full.")
+#     return full_to_seg, kept_full
+
 def compute_full_to_seg_map(
     trained_gs_seg,
     full_model,
-    batch_seg=2048,
-    batch_full=16384,
+    batch_seg=2048,   # kept for compatibility
+    batch_full=16384 # kept for compatibility
 ):
     """
-    CPU-based NN mapping (OOM-proof).
-    Uses streamed blocks, no large intermediate allocations.
+    Fast NN mapping using FAISS (CPU).
+
+    Drop-in replacement:
+    - Same name
+    - Same outputs
+    - No O(N^2) loops
     """
-    full_xyz = full_model.get_xyz.detach().cpu()        # [N_full, 3]
-    seg_xyz  = trained_gs_seg.get_xyz.detach().cpu()   # [N_seg, 3]
+
+
+    # -------------------------------------------------
+    # Move data to CPU numpy
+    # -------------------------------------------------
+    full_xyz = full_model.get_xyz.detach().cpu().numpy().astype("float32")
+    seg_xyz  = trained_gs_seg.get_xyz.detach().cpu().numpy().astype("float32")
 
     N_full = full_xyz.shape[0]
     N_seg  = seg_xyz.shape[0]
 
-    kept_full = []
+    print("[map] Building FAISS index (CPU)...")
 
-    print("[map] Computing NN positions (CPU streamed)...")
+    # -------------------------------------------------
+    # FAISS exact L2 index
+    # -------------------------------------------------
+    index = faiss.IndexFlatL2(3)
+    index.add(full_xyz)
 
-    # Precompute full-model squared norms once
-    full_norm = (full_xyz ** 2).sum(dim=1)   # [N_full]
+    print("[map] Querying nearest neighbors...")
 
-    # ---- tqdm over segmented Gaussians ----
-    seg_range = range(0, N_seg, batch_seg)
-    for s0 in tqdm(seg_range, desc="[map] Seg blocks", total=len(seg_range)):
-        s1 = min(s0 + batch_seg, N_seg)
-        seg_block = seg_xyz[s0:s1]           # [bs, 3]
-        bs = seg_block.shape[0]
+    # Search 1-NN for all segmented gaussians
+    _, kept_full = index.search(seg_xyz, 1)
+    kept_full = torch.from_numpy(kept_full[:, 0]).long()
 
-        # squared norms for seg block
-        seg_norm = (seg_block ** 2).sum(dim=1)  # [bs]
-
-        best_dist = torch.full((bs,), float("inf"))
-        best_idx  = torch.full((bs,), -1, dtype=torch.long)
-
-        # ---- streamed full-model blocks ----
-        for f0 in range(0, N_full, batch_full):
-            f1 = min(f0 + batch_full, N_full)
-            full_block = full_xyz[f0:f1]     # [bf, 3]
-
-            # dist^2 = ||x||^2 + ||y||^2 - 2 x·y
-            d = (
-                seg_norm[:, None]
-                + full_norm[f0:f1][None, :]
-                - 2.0 * (seg_block @ full_block.T)
-            )  # [bs, bf]
-
-            block_min_dist, block_min_pos = d.min(dim=1)
-
-            better = block_min_dist < best_dist
-            best_dist[better] = block_min_dist[better]
-            best_idx[better]  = block_min_pos[better] + f0
-
-            del d, full_block, block_min_dist, block_min_pos, better
-
-        kept_full.append(best_idx)
-
-        del seg_block, seg_norm, best_dist, best_idx
-
-    kept_full = torch.cat(kept_full)  # [N_seg]
-
-    # Move back to GPU only final outputs
+    # -------------------------------------------------
+    # Build full -> seg mapping
+    # -------------------------------------------------
     device = full_model.get_xyz.device
-    kept_full = kept_full.to(device)
 
     full_to_seg = torch.full(
         (N_full,), -1, dtype=torch.long, device=device
     )
-    full_to_seg[kept_full] = torch.arange(N_seg, device=device)
+
+    full_to_seg[kept_full.to(device)] = torch.arange(
+        N_seg, device=device
+    )
 
     print(f"[map] Done. Mapped {N_seg} seg → {N_full} full.")
-    return full_to_seg, kept_full
+
+    return full_to_seg, kept_full.to(device)
 
 # -----------------------------
 # Map full Top-K -> segmented Top-K (vectorized)
@@ -520,16 +577,16 @@ def filter_coherent_gaussians(gaussian_model, threshold=0.6):
     coherence = compute_instance_coherence(logits, ids)
 
     # --- DEBUG: Inspect coherence distribution ---
-    # print("[DEBUG] Coherence stats:",
-    #       f"min={coherence.min().detach().item():.4f}, "
-    #       f"max={coherence.max().detach().item():.4f}, "
-    #       f"mean={coherence.mean().detach().item():.4f}, "
-    #       f"median={coherence.median().detach().item():.4f}")
+    print("[DEBUG] Coherence stats:",
+          f"min={coherence.min().detach().item():.4f}, "
+          f"max={coherence.max().detach().item():.4f}, "
+          f"mean={coherence.mean().detach().item():.4f}, "
+          f"median={coherence.median().detach().item():.4f}")
 
     mask = coherence >= threshold
     kept_count = mask.sum().item()
     total_count = xyz.shape[0]
-    # print(f"[INFO] Keeping {kept_count} / {total_count} coherent Gaussians (TH={threshold})")
+    print(f"[INFO] Keeping {kept_count} / {total_count} coherent Gaussians (TH={threshold})")
 
     # Create new GaussianModel with filtered attributes
     filtered_gs = GaussianModel(sh_degree=gaussian_model.active_sh_degree)
@@ -611,13 +668,10 @@ def dt_norm_to_real(dt_norm, dt_scale):
     dt_real = dt_norm * dt_scale
     return dt_real
 
-# --------------------------------------------------------------------
-# Refine the clusters iteratively with a metrics
-# --------------------------------------------------------------------
 def refine_clusters_with_metric(
     self,
     max_iters=5,
-    gather_alpha=0.5,
+    gather_alpha=0.5,          # now interpreted as merge threshold for shared points
     explore_ratio=0.1,
     w_geom=1.0,
     w_coh=1.0,
@@ -627,12 +681,10 @@ def refine_clusters_with_metric(
     spatial_consistency_weight=0.1,
 ):
     """
-    Refine self.point_clusters maximizing combined score:
-        score = w_geom * geom_term * (coherence ** alpha)
-              + w_size * size_balance
-              + w_count * cluster_count_term
-              + spatial consistency regularization
+    Refine self.point_clusters maximizing combined score.
+    Merges clusters that share the same 3D points (different masks of same fruit).
     """
+
     eps = 1e-8
 
     def get_xyz(pid):
@@ -673,6 +725,7 @@ def refine_clusters_with_metric(
         centroids = {cid: np.mean([get_xyz(pid) for pid in pts], axis=0) for cid, pts in cluster_points.items()}
         cid_list = list(centroids.keys())
 
+        # Compute geometry metrics
         intra_dists = {cid: np.linalg.norm(np.vstack([get_xyz(pid) for pid in pts]) - centroids[cid], axis=1).mean()
                        for cid, pts in cluster_points.items()}
         inter_dists = [np.linalg.norm(centroids[cid_list[i]] - centroids[cid_list[j]])
@@ -694,16 +747,30 @@ def refine_clusters_with_metric(
         geom_with_coh = geom_term * (coherence ** alpha)
         score = (w_geom * geom_with_coh) + (w_size * size_balance) + (w_count * cluster_count_term)
 
-        # Gathering: merge close centroids
-        thresh = gather_alpha * (mean_inter + eps)
-        merge_candidates = [(cid_list[i], cid_list[j])
-                            for i in range(len(cid_list)) for j in range(i+1, len(cid_list))
-                            if np.linalg.norm(centroids[cid_list[i]] - centroids[cid_list[j]]) < thresh]
-        for a, b in merge_candidates:
-            for pid in cluster_points[b]:
-                clusters[pid] = a
+        # ---------- Step: Merge clusters based on shared 3D points ----------
+        merge_threshold = gather_alpha  # fraction of shared points to merge
+        merged = set()
+        cid_list = list(cluster_points.keys())
 
-        # Reassignment with spatial consistency
+        for i in range(len(cid_list)):
+            for j in range(i + 1, len(cid_list)):
+                cid_a, cid_b = cid_list[i], cid_list[j]
+                if cid_a in merged or cid_b in merged:
+                    continue
+                points_a = set(cluster_points[cid_a])
+                points_b = set(cluster_points[cid_b])
+                if not points_a or not points_b:
+                    continue
+
+                # Fraction of shared points relative to smaller cluster
+                shared_ratio = len(points_a & points_b) / min(len(points_a), len(points_b))
+                if shared_ratio >= merge_threshold:
+                    # merge cid_b into cid_a
+                    for pid in points_b:
+                        clusters[pid] = cid_a
+                    merged.add(cid_b)
+
+        # ---------- Step: spatial reassignment ----------
         cluster_points = build_cluster_points_map(clusters)
         centroids = {cid: np.mean([get_xyz(pid) for pid in pts], axis=0) for cid, pts in cluster_points.items()}
         cid_list = list(centroids.keys())
@@ -737,4 +804,3 @@ def refine_clusters_with_metric(
 
     self.point_clusters = clusters
     return clusters
-

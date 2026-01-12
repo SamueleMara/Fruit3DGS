@@ -37,7 +37,7 @@ from PIL import Image
 
 from scipy.spatial import cKDTree
 from sklearn.neighbors import KDTree,NearestNeighbors
-from skopt import gp_minimize
+from skopt import gp_minimize, Optimizer
 
 HAVE_CUML = False
 try:
@@ -169,7 +169,7 @@ class Scene:
     # --------------------------------------------------------------------------
     # NEW FUNCTION: load both trained model and COLMAP-seed Gaussian model
     # --------------------------------------------------------------------------
-    def load_with_colmap_seed(self, args: ModelParams, load_iteration=None, mask_dir=None,num_its_BO=20,bo_optimize=False):
+    def load_with_colmap_seed(self, args: ModelParams, load_iteration=None, mask_dir=None,num_its_BO=100,bo_optimize=False,patience=10):
         """
         Loads both:
         - The trained Gaussian model (from .ply)
@@ -238,12 +238,23 @@ class Scene:
 
         if bo_optimize:
             print("[Scene] Running Bayesian Optimization for instance clustering...")
+            
+            # ---------------------
+            # BO setup
+            # ---------------------
+            dimensions = [(0.01, 0.1), (0.5, 2.0)]  # jaccard_threshold, spatial_weight
+            bo_opt = Optimizer(dimensions, random_state=42)
+            best_score = -np.inf
+            best_params = None
+            no_improve_count = 0
+            patience = 10  # stop if no improvement for these many iterations
 
-            # Wrap the BO objective with tqdm
             progress_bar = tqdm(total=num_its_BO, desc="[Scene] BO iterations", leave=True)
 
-            def bo_objective(params):
+            for i in range(num_its_BO):
+                params = bo_opt.ask()
                 jaccard_threshold, spatial_weight = params
+
                 clusters = self.build_instance_seed_clusters(
                     mask_dir,
                     device=self.device,
@@ -255,6 +266,7 @@ class Scene:
                     reuse_precomputed=True
                 )
 
+                # Compute coherence
                 def get_xyz(pid):
                     return np.asarray(self.points3D[pid].xyz, dtype=np.float32)[:3]
 
@@ -268,13 +280,13 @@ class Scene:
                     nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='kd_tree').fit(X)
                     _, indices = nbrs.kneighbors(X)
                     coherences = []
-                    for i, neigh_idx in enumerate(indices):
-                        neigh_idx = neigh_idx[1:]
-                        same = (labels[neigh_idx] == labels[i])
+                    for i_pt, neigh_idx in enumerate(indices):
+                        neigh_idx = neigh_idx[1:]  # skip self
+                        same = (labels[neigh_idx] == labels[i_pt])
                         coherences.append(np.mean(same))
                     coherence = float(np.mean(coherences))
 
-                # Geometric compactness penalty (avg cluster radius)
+                # Optional geometric compactness penalty
                 clusters_xyz = defaultdict(list)
                 pid_to_idx = {pid:i for i,pid in enumerate(pids)}
                 for pid, cid in clusters.items():
@@ -286,27 +298,33 @@ class Scene:
                     avg_radius = np.mean([np.mean(np.linalg.norm(np.stack(pts) - np.mean(np.stack(pts), axis=0), axis=1)) for pts in clusters_xyz.values()])
 
                 score = coherence  # or coherence - 0.2*avg_radius
-                progress_bar.update(1)  # update tqdm bar for each BO iteration
-                return -score
+                bo_opt.tell(params, -score)  # minimize negative score
+                progress_bar.update(1)
 
-            res = gp_minimize(
-                bo_objective,
-                dimensions=[(0.01, 0.1), (0.5, 2.0)],  # jaccard_threshold, spatial_weight
-                n_calls=num_its_BO,
-                random_state=42
-            )
+                # ---------------------
+                # Patience check
+                # ---------------------
+                if score > best_score:
+                    best_score = score
+                    best_params = params
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+
+                if no_improve_count >= patience:
+                    print(f"[Scene] BO early stopping at iteration {i} (no improvement for {patience} steps)")
+                    break
 
             progress_bar.close()
-
-            best_jaccard, best_spatial = res.x
-            print(f"[Scene] BO result: jaccard_threshold={best_jaccard:.3f}, spatial_weight={best_spatial:.3f}")
+            jaccard_threshold, spatial_weight = best_params
+            print(f"[Scene] BO finished. Best score={best_score:.4f}, jaccard_threshold={jaccard_threshold:.4f}, spatial_weight={spatial_weight:.4f}")
 
             # Build clusters with best parameters
             point_clusters = self.build_instance_seed_clusters(
                 mask_dir,
                 device=self.device,
-                jaccard_threshold=best_jaccard,
-                spatial_consistency_weight=best_spatial,
+                jaccard_threshold=jaccard_threshold,
+                spatial_consistency_weight=spatial_weight,
                 refine_iters=100,
                 verbose=True,
                 precomputed=self._precomputed_masks,
@@ -529,7 +547,7 @@ class Scene:
     def build_instance_seed_clusters(
         self,
         mask_dir,
-        device=None,  # <-- added device argument
+        device=None,
         jaccard_threshold=0.01,
         spatial_consistency_weight=0.5,
         min_shared=1,
@@ -538,31 +556,31 @@ class Scene:
         precomputed=None,
         reuse_precomputed=True
     ):
-        """
-        Build global instance clusters with instance-aware masks.
-        Heavy GPU propagation is computed only once per scene.
-        """
-
-        # Use provided device or default to self.device
+        
         device = device or self.device
 
-        # ---------- Step 0: decide which precomputed mapping to use ----------
+        # ---------- Step 0: precomputation ----------
         if precomputed is not None and reuse_precomputed:
             self._precomputed_masks = precomputed
         elif self._precomputed_masks is None:
-            mask_instances, point_to_masks, mask_to_points, multi_view_links = masks_utils.compute_and_propagate_masks(
-                points3D=self.points3D,
-                images=self.images,
-                mask_dir=mask_dir,
-                gs_cameras=self.gs_cameras_by_name,  # flattened dict: image_stem -> Camera
-                device=device,                        # use device here
-                subset_frames=None,
-                point_to_pixels=self.point_to_pixels  
-            )
+            mask_instances, point_to_masks, mask_to_points, multi_view_links = \
+                masks_utils.compute_and_propagate_masks(
+                    points3D=self.points3D,
+                    images=self.images,
+                    mask_dir=mask_dir,
+                    gs_cameras=self.gs_cameras_by_name,
+                    device=device,
+                    subset_frames=None,
+                    point_to_pixels=self.point_to_pixels
+                )
+
             overlaps = masks_utils.compute_mask_overlaps(
-                point_to_masks, mask_to_points, min_shared=min_shared, top_k=10**9,
+                point_to_masks, mask_to_points,
+                min_shared=min_shared,
+                top_k=10**9,
                 log=(print if verbose else (lambda *a, **k: None))
             )
+
             self._precomputed_masks = {
                 "mask_instances": mask_instances,
                 "point_to_masks": point_to_masks,
@@ -570,74 +588,71 @@ class Scene:
                 "multi_view_links": multi_view_links,
                 "overlaps": overlaps
             }
-            if verbose:
-                print("[Scene] Precomputed mask mappings stored for reuse.")
 
-        # Use cached/precomputed
-        mask_instances = self._precomputed_masks["mask_instances"]
         point_to_masks = self._precomputed_masks["point_to_masks"]
         mask_to_points = self._precomputed_masks["mask_to_points"]
         overlaps = self._precomputed_masks["overlaps"]
-        multi_view_links = self._precomputed_masks["multi_view_links"]
 
-        self.mask_instances = mask_instances
-        self._cached_point_to_masks = point_to_masks
-        self._cached_mask_to_points = mask_to_points
-        self._cached_multi_view_links = multi_view_links
-
-        # ---------- Step 1: merge groups based on Jaccard ----------
+        # ---------- Step 1: union-find on MASK IDS (tuples!) ----------
         parent = {}
 
-        def make_hashable(x):
-            return tuple(x) if isinstance(x, list) else x
+        def normalize_mask_id(m):
+            # ensures mask id is hashable and consistent
+            return tuple(m) if isinstance(m, (list, tuple)) else m
 
         def find_m(x):
-            key = make_hashable(x)
-            parent.setdefault(key, key)
-            if parent[key] != key:
-                parent[key] = find_m(parent[key])
-            return parent[key]
+            x = normalize_mask_id(x)
+            parent.setdefault(x, x)
+            if parent[x] != x:
+                parent[x] = find_m(parent[x])
+            return parent[x]
 
         def union_m(a, b):
             ra, rb = find_m(a), find_m(b)
             if ra != rb:
                 parent[rb] = ra
 
-        for a, b, shared, jaccard_val, sA, sB in overlaps:
+        for a, b, shared, jaccard_val, *_ in overlaps:
             if jaccard_val >= jaccard_threshold:
-                union_m(a, b)
+                union_m(normalize_mask_id(a), normalize_mask_id(b))
 
-        all_masks = set(mask_to_points.keys())
-        groups = defaultdict(list)
-        for m in all_masks:
-            groups[find_m(m)].append(m)
-
-        merged_groups = [sorted(g) for g in groups.values() if len(g) > 1]
-        if verbose:
-            print(f"[INFO] Found {len(merged_groups)} merge candidate groups with jaccard >= {jaccard_threshold}")
-
-        # ---------- Step 2: initial point->instance assignment ----------
-        point_to_instance = {pid: masks[0] if masks else -1 for pid, masks in point_to_masks.items()}
-
-        # ---------- Step 3: union merged groups ----------
-        for m in mask_to_points.keys():
-            parent.setdefault(make_hashable(m), make_hashable(m))
-
+        # ---------- Step 2: vectorized point → root-mask ----------
         clusters = {pid: -1 for pid in self.points3D.keys()}
-        cluster_id_map = {}
-        cid = 0
-        for pid, inst in point_to_instance.items():
-            if inst == -1:
+        root_to_cid = {}
+        cid_counter = 0
+
+        for pid, masks in point_to_masks.items():
+            if not masks:
                 continue
-            root = find_m(inst)
-            if root not in cluster_id_map:
-                cluster_id_map[root] = cid
-                cid += 1
-            clusters[pid] = cluster_id_map[root]
+
+            root = find_m(normalize_mask_id(masks[0]))
+            if root not in root_to_cid:
+                root_to_cid[root] = cid_counter
+                cid_counter += 1
+
+            clusters[pid] = root_to_cid[root]
+
+        if verbose:
+            roots = set()
+            for pid, masks in point_to_masks.items():
+                if masks:
+                    roots.add(find_m(normalize_mask_id(masks[0])))
+            print(f"[DEBUG] Unique mask roots: {len(roots)}")    
 
         self.point_clusters = clusters
 
-        # ---------- Step 4: refine clusters ----------
+        # ---------- DEBUG: initial clustering ----------
+        if verbose:
+            from collections import Counter
+            cnt = Counter(clusters.values())
+            print("\n[DEBUG] Initial clustering")
+            print(f"  Total points      : {len(clusters)}")
+            print(f"  Background (-1)   : {cnt.get(-1, 0)}")
+            print(f"  Num clusters      : {len([k for k in cnt if k != -1])}")
+            for k, v in cnt.most_common(10):
+                print(f"    {'BG' if k==-1 else f'C{k}'}: {v}")
+
+        # ---------- Step 3: refinement ----------
         refine_clusters_with_metric(
             self,
             max_iters=refine_iters,
@@ -649,7 +664,18 @@ class Scene:
             spatial_consistency_weight=spatial_consistency_weight
         )
 
+        # ---------- DEBUG: post-refinement ----------
+        if verbose:
+            from collections import Counter
+            cnt = Counter(self.point_clusters.values())
+            print("\n[DEBUG] Post-refinement")
+            print(f"  Background (-1)   : {cnt.get(-1, 0)}")
+            print(f"  Num clusters      : {len([k for k in cnt if k != -1])}")
+            for k, v in cnt.most_common(10):
+                print(f"    {'BG' if k==-1 else f'C{k}'}: {v}")
+
         return self.point_clusters
+
 
 
     def build_gaussian_instance_adjacency(
