@@ -56,6 +56,9 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
     means2D = screenspace_points
     opacity = pc.get_opacity
 
+    # TO DO: pass directly the semantic fiel dto render computing F[ch] += sem[collected_id[j]*CHANNELS + ch] * alpha * T;
+    sem = pc.get_sem
+
     # Covariance or scale/rotation
     scales, rotations, cov3D_precomp = None, None, None
     if pipe.compute_cov3D_python:

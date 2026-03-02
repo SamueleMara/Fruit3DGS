@@ -20,8 +20,6 @@ from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from utils.read_write_model import read_model
-from utils.cluster_utils import compute_mask_centroids,refine_clusters_with_metric
-from utils.visualize_clusters import visualize_colmap_clusters
 from utils import masks_utils
 from scene.colmap_masker import ColmapMaskFilter
 
@@ -60,13 +58,16 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], mask_dir=None):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], mask_dir=None, load_filtered=False):
         """
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+    
+        self.device =  args.data_device
+        self.load_filtered = load_filtered
 
         if load_iteration:
             if load_iteration == -1:
@@ -77,6 +78,9 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
+        self.gs_cameras_by_id = {}
+        self.gs_cameras_by_name = {}
+        self.gs_cameras_scale = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
@@ -108,19 +112,44 @@ class Scene:
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(
-                scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False, mask_dir=mask_dir
+            # Train cameras
+            train_list = cameraList_from_camInfos(
+                scene_info.train_cameras,
+                resolution_scale,
+                args,
+                scene_info.is_nerf_synthetic,
+                False,
+                mask_dir=mask_dir
             )
-            gs_camera_list = self.train_cameras[resolution_scale] 
-            self.gs_cameras = {Path(cam.image_name).stem: cam for cam in gs_camera_list}
-            
+            self.train_cameras[resolution_scale] = train_list
+
+            # Build mappings per resolution
+            self.gs_cameras_by_id = {cam.uid: cam for cam in train_list}
+            self.gs_cameras_by_name = {Path(cam.image_name).stem: cam for cam in train_list}
+            self.gs_cameras =  self.gs_cameras_by_name
+            self.gs_cameras_scale = {
+                cam.uid: (cam.original_image.shape[2]/cam.image_width,
+                        cam.original_image.shape[1]/cam.image_height)
+                for cam in train_list
+            }
+
+            # Test cameras       
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(
                 scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True, mask_dir=mask_dir
             )
 
         if self.loaded_iter:
-            self.gaussians.load_ply(os.path.join(self.model_path, 
+
+            if self.load_filtered==True:
+                print("Loading Filtered trained Model")
+                self.gaussians.load_ply(os.path.join(self.model_path, 
+                                                            "point_cloud",
+                                                            "iteration_" + str(self.loaded_iter),
+                                                            "scene_mask_filtered_renderer.ply"), args.train_test_exp)
+            else:
+                print("Loading Unfiltered trained Model")
+                self.gaussians.load_ply(os.path.join(self.model_path, 
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args.train_test_exp)
@@ -143,6 +172,8 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+        
 
     # --------------------------------------------------------------------------
     # NEW FUNCTION: load both trained model and COLMAP-seed Gaussian model
@@ -204,7 +235,7 @@ class Scene:
                 images=self.images,
                 mask_instances=mask_instances,
                 gs_cameras=self.gs_cameras,
-                device="cuda"
+                device="cpu"
             )
             precomputed = {
                 "mask_instances": mask_instances,
@@ -221,7 +252,7 @@ class Scene:
                 jaccard_threshold, spatial_weight = params
                 clusters = self.build_instance_seed_clusters(
                     mask_dir,
-                    device="cuda",
+                    device="cpu",
                     jaccard_threshold=jaccard_threshold,
                     spatial_consistency_weight=spatial_weight,
                     refine_iters=1,
@@ -280,7 +311,7 @@ class Scene:
             # Build clusters with best parameters
             point_clusters = self.build_instance_seed_clusters(
                 mask_dir,
-                device="cuda",
+                device="cpu",
                 jaccard_threshold=best_jaccard,
                 spatial_consistency_weight=best_spatial,
                 refine_iters=100,
@@ -346,50 +377,6 @@ class Scene:
                 trained_gaussians.load_ply(trained_model_seg_path, args.train_test_exp)
 
         return trained_gaussians, seed_gaussians, scene_info
-
-    # --------------------------------------------------------------------------
-    # NEW FUNCTION: save the clustered ply with an additional cluster_id field
-    # --------------------------------------------------------------------------
-    def save_clustered_ply(self, path, gaussians, cluster_ids=None):
-        """
-            Save Gaussian points as PLY, optionally including cluster IDs for visualization.
-
-            Args:
-                path (str): output PLY path
-                gaussians (GaussianModel): Gaussian model to save
-                cluster_ids (Tensor[N], optional): cluster assignment per Gaussian
-            """
-        mkdir_p(os.path.dirname(path))
-        xyz = gaussians._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
-        f_dc = gaussians._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = gaussians._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = gaussians._opacity.detach().cpu().numpy()
-        scale = gaussians._scaling.detach().cpu().numpy()
-        rotation = gaussians._rotation.detach().cpu().numpy()
-
-        semantics = None
-        if gaussians.semantic_mask is not None:
-            semantics = gaussians.semantic_mask.detach().cpu().numpy()[..., None]
-
-        dtype_full = [(attribute, 'f4') for attribute in gaussians.construct_list_of_attributes()]
-        if cluster_ids is not None:
-            dtype_full.append(('cluster_id', 'i4'))
-
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attrs = [xyz, normals, f_dc, f_rest, opacities, scale, rotation]
-        attributes = np.concatenate([a if a.ndim == 2 else a.reshape(a.shape[0], -1) for a in attrs], axis=1)
-        if semantics is not None:
-            attributes = np.concatenate((attributes, semantics), axis=1)
-        if cluster_ids is not None:
-            cluster_np = cluster_ids.detach().cpu().numpy()[..., None]
-            attributes = np.concatenate((attributes, cluster_np), axis=1)
-
-        elements[:] = list(map(tuple, attributes))
-        el = PlyElement.describe(elements, 'vertex')
-        PlyData([el], text=True).write(path)
-
-        print(f"[OK] Clustered PLY saved at {path}")
 
     # ---------------------------------
     # NEW FUNCTION: load colmap model
@@ -500,7 +487,7 @@ class Scene:
     def build_instance_seed_clusters(
         self,
         mask_dir,
-        device="cuda",
+        device="cpu",
         jaccard_threshold=0.01,
         spatial_consistency_weight=0.5,
         min_shared=1,
@@ -622,7 +609,7 @@ class Scene:
         mask_images,            # list of C masks, each [I, H, W]
         num_gaussians,
         num_mask_instances,
-        device="cuda"
+        device="cpu"
     ):
         """
         Fully optimized + vectorized construction of adjacency:

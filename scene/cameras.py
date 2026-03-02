@@ -87,13 +87,15 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
-        # --- Semantic mask loading ---
+       # --- Semantic mask loading ---
         self.mask = None
+        self.has_valid_mask = False
+
         if mask_dir is not None:
             base_name = os.path.splitext(self.image_name)[0]
-            # Accept both lowercase and uppercase extensions
+
             exts = ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
-            exts += [e.upper() for e in exts]  # add uppercase variants
+            exts += [e.upper() for e in exts]
 
             mask_path = None
             for ext in exts:
@@ -103,24 +105,32 @@ class Camera(nn.Module):
                     mask_path = matches[0]
                     break
 
-            if mask_path:
+            if mask_path is not None:
                 mask_img = imageio.imread(mask_path)
-                mask_tensor = torch.from_numpy(mask_img.astype(np.float32) / 255.0)
 
-                # If RGB, convert to single channel
-                if mask_tensor.ndim == 3:
-                    mask_tensor = mask_tensor[..., 0]
+                if mask_img is not None:
+                    mask_tensor = torch.from_numpy(mask_img.astype(np.float32) / 255.0)
 
-                # Resize to match image size
-                mask_tensor_resized = cv2.resize(
-                    mask_tensor.numpy(),
-                    (self.image_width, self.image_height),
-                    interpolation=cv2.INTER_LINEAR
-                )
-                self.mask = torch.from_numpy(mask_tensor_resized).float().to(self.data_device)
+                    # RGB → single channel
+                    if mask_tensor.ndim == 3:
+                        mask_tensor = mask_tensor[..., 0]
+
+                    mask_tensor_resized = cv2.resize(
+                        mask_tensor.numpy(),
+                        (self.image_width, self.image_height),
+                        interpolation=cv2.INTER_NEAREST
+                    )
+
+                    # Check if mask is non-empty
+                    if np.any(mask_tensor_resized > 0):
+                        self.mask = torch.from_numpy(mask_tensor_resized).float().to(self.data_device)
+                        self.has_valid_mask = True
+                    else:
+                        self.mask = None
+                        self.has_valid_mask = False
             else:
-                print(f"[WARNING] No mask found for camera {self.image_name} in {mask_dir}")
                 self.mask = None
+                self.has_valid_mask = False
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

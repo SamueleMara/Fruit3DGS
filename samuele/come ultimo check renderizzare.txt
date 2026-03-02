@@ -1,0 +1,1 @@
+come ultimo check renderizzare le istanze sulle immagini e controllare che il numero di istanze coincida con la GT

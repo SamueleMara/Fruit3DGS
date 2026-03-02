@@ -28,6 +28,21 @@ def load_mask_cpu(mask_path, downsample=1):
         mask = mask[::downsample, ::downsample]
     return mask
 
+def flatten_mask(x):
+    """
+    Recursively flatten nested dicts/lists/arrays into a 1D list
+    """
+    flat = []
+    if isinstance(x, dict):
+        for v in x.values():
+            flat.extend(flatten_mask(v))
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            flat.extend(flatten_mask(v))
+    else:
+        flat.append(x)
+    return flat
+
 def list_masks_for_frame(mask_dir, frame_name, log=print):
     mask_dir = Path(mask_dir)
     mask_files = sorted(
@@ -39,34 +54,83 @@ def list_masks_for_frame(mask_dir, frame_name, log=print):
     return mask_files
 
 def compute_mask_instances_json(mask_dir, downsample=1, save_path=None, log=print):
+    """
+    Compute mask instances for all images in a folder, storing per-instance pixel indices.
+
+    Accepts multiple extensions and upper/lowercase variants:
+      <frame>_instance_<id>.(png|jpg|jpeg|bmp|tif|tiff) and uppercase versions.
+
+    Uses normalize_gs_cam_name() so the produced frame keys match Scene/GS camera naming.
+    Also stores the pixel (flat index) closest to centroid.
+
+    Returns:
+        mask_instances[frame_name][instance_id] = {
+            "centroid": [cx, cy],
+            "centroid_pixel": int,          # flat index in [0, H*W)
+            "bbox": [xmin, ymin, xmax, ymax],
+            "area": int,
+            "pixel_indices": list[int],     # flat indices
+        }
+    """
     mask_dir = Path(mask_dir)
-    mask_files = sorted(mask_dir.glob("*_instance_*.png"))
+
+    exts = ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
+    exts += [e.upper() for e in exts]
+
+    mask_files = []
+    for ext in exts:
+        mask_files.extend(mask_dir.glob(f"*_instance_*.{ext}"))
+    mask_files = sorted(mask_files)
+
     mask_instances = {}
 
     for mask_path in tqdm(mask_files, desc="[mask_utils] Extracting mask_instances"):
         stem = mask_path.stem
-        frame_name, midx_str = stem.rsplit("_instance_", 1)
-        midx = int(midx_str)
+        try:
+            raw_frame_name, midx_str = stem.rsplit("_instance_", 1)
+        except ValueError:
+            continue
+
+        frame_name = normalize_frame_key(raw_frame_name)  
+        try:
+            midx = int(midx_str)
+        except ValueError:
+            continue
 
         mask = load_mask_cpu(str(mask_path), downsample)
-        if mask.sum() == 0:
+        if mask is None or mask.size == 0 or mask.sum() == 0:
             continue
 
         ys, xs = np.nonzero(mask)
+        if xs.size == 0:
+            continue
+
+        H, W = mask.shape[:2]
+
         cx, cy = float(xs.mean()), float(ys.mean())
         xmin, xmax = int(xs.min()), int(xs.max())
         ymin, ymax = int(ys.min()), int(ys.max())
         area = int(mask.sum())
 
+        flat_idx = (ys.astype(np.int64) * int(W) + xs.astype(np.int64)).tolist()
+
+        # centroid-pixel using xs/ys directly
+        x0, y0, _ = pick_mask_pixel_closest_to_centroid_xy(xs, ys, [cx, cy])
+        centroid_pixel = xy_to_flat(x0, y0, W) if x0 >= 0 else -1  # xy_to_flat call is correct
+
         if frame_name not in mask_instances:
             mask_instances[frame_name] = {}
+
         mask_instances[frame_name][midx] = {
             "centroid": [cx, cy],
+            "centroid_pixel": int(centroid_pixel),
             "bbox": [xmin, ymin, xmax, ymax],
-            "area": area
+            "area": int(area),
+            "pixel_indices": flat_idx,
         }
 
     if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         with open(save_path, "w") as f:
             json.dump(mask_instances, f, indent=2)
         log(f"[INFO] Saved mask_instances JSON to {save_path}")
@@ -547,7 +611,7 @@ def plot_mask_instance_points(points3D, images, mask_instances, mask_dir, output
             print(f"[OK] Saved: {out_path}")
 
 
-def propagate_all_masks_gpu(points3D, images, mask_instances, gs_cameras, device="cuda"):
+def propagate_all_masks_gpu(points3D, images, mask_instances, gs_cameras, device="gpu"):
     """
     Propagate mask-instance assignments from all source frames to all other frames
     using Gaussian Splatting cameras (GS cameras).
@@ -635,3 +699,106 @@ def propagate_all_masks_gpu(points3D, images, mask_instances, gs_cameras, device
                         mapping[src_key].append((dst_frame, dst_mask_id))
 
     return mapping
+
+
+def pick_mask_pixel_closest_to_centroid_xy(xs, ys, centroid_xy):
+    """
+    Pick the *mask* pixel closest to the centroid, using the (xs, ys) arrays
+    already available in compute_mask_instances_json (from np.nonzero(mask)).
+
+    Args:
+        xs: 1D array-like of x coords (cols) for foreground pixels
+        ys: 1D array-like of y coords (rows) for foreground pixels
+        centroid_xy: [cx, cy] floats
+
+    Returns:
+        (x_closest, y_closest, idx) where:
+          - x_closest, y_closest are ints (pixel coords)
+          - idx is the index into xs/ys arrays (useful if you want to fetch other per-pixel info)
+        If empty/invalid -> (-1, -1, -1)
+    """
+    if xs is None or ys is None or centroid_xy is None:
+        return -1, -1, -1
+
+    xs = np.asarray(xs)
+    ys = np.asarray(ys)
+    if xs.size == 0 or ys.size == 0:
+        return -1, -1, -1
+
+    cx, cy = float(centroid_xy[0]), float(centroid_xy[1])
+    d2 = (xs.astype(np.float32) - cx) ** 2 + (ys.astype(np.float32) - cy) ** 2
+    k = int(np.argmin(d2))
+    return int(xs[k]), int(ys[k]), k
+
+
+def xy_to_flat(x, y, W):
+    return int(y) * int(W) + int(x)
+
+def normalize_frame_key(k: str):
+    """
+    Robust frame key normalization:
+    - strips whitespace
+    - strips directory path
+    - strips extension(s) case-insensitively (PNG/JPG/JPEG/etc.)
+    - preserves the base name like 'rgb_000'
+    """
+    if k is None:
+        return None
+
+    k = str(k).strip()
+
+    # keep only filename (in case paths leak in)
+    k = os.path.basename(k)
+
+    # repeatedly strip known image extensions (case-insensitive)
+    # (handles 'rgb_000.PNG', 'rgb_000.jpeg', and even 'rgb_000.png.png')
+    while True:
+        root, ext = os.path.splitext(k)
+        if ext.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}:
+            k = root
+        else:
+            break
+
+    return k
+
+
+def filter_mask_instances_by_scene_cameras(mask_instances_dict, scene, verbose=True):
+    """
+    Keep only mask_instances entries whose frame key exists in scene.gs_cameras.
+    Uses normalize_frame_key() on both sides for robustness.
+
+    Returns:
+        filtered_mask_instances_dict
+    """
+    # 1) scene camera keys (normalized)
+    cam_names_raw = list(scene.gs_cameras.keys())
+    cam_norm_set = {normalize_frame_key(k) for k in cam_names_raw}
+
+    # 2) filter masks by intersection
+    kept = {}
+    dropped = []
+    for k, v in mask_instances_dict.items():
+        nk = normalize_frame_key(k)
+        if nk in cam_norm_set:
+            # store under the *scene-normalized* key to avoid duplicates / mismatch later
+            kept[nk] = v
+        else:
+            dropped.append(k)
+
+    # 3) optional stats
+    if verbose:
+        mask_norm_set = {normalize_frame_key(k) for k in mask_instances_dict.keys()}
+        missing_in_masks = sorted(list(cam_norm_set - mask_norm_set))
+        print("[MaskFilter] ---- mask_instances ↔ scene.gs_cameras ----")
+        print(f"[MaskFilter] scene cameras:         {len(cam_names_raw)}")
+        print(f"[MaskFilter] mask frames (raw):      {len(mask_instances_dict)}")
+        print(f"[MaskFilter] mask frames kept:       {len(kept)}")
+        print(f"[MaskFilter] mask frames dropped:    {len(dropped)}")
+        print(f"[MaskFilter] scene frames missing masks: {len(missing_in_masks)}")
+        if len(dropped) > 0:
+            print(f"[MaskFilter] example dropped: {dropped[:5]}")
+        if len(missing_in_masks) > 0:
+            print(f"[MaskFilter] example missing: {missing_in_masks[:5]}")
+        print("[MaskFilter] -------------------------------------------\n")
+
+    return kept

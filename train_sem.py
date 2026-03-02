@@ -1,3 +1,4 @@
+
 #
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
@@ -43,7 +44,7 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, mask_dir=None, topk_contrib=8 ):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, mask_dir=None, topk_contrib=8, semantic_threshold=0.3):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -142,7 +143,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             bg,
             use_trained_exp=dataset.train_test_exp,
             separate_sh=SPARSE_ADAM_AVAILABLE,
-            contrib=use_contrib,   # previously: contrib=False if not is_last_iter else True
+            contrib=use_contrib,   
             K=topk_contrib
         )
         # ----------------------------------------------------
@@ -177,6 +178,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         if viewpoint_cam.mask is not None and contrib_indices is not None and contrib_opacities is not None:
+            torch.cuda.empty_cache()
             gt_mask = viewpoint_cam.mask.cuda()
             mask_loss = binary_mask_render_loss(
                 gaussians.semantic_mask,
@@ -276,7 +278,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if is_last_iter and use_mask_filtering:
                 print(f"\n[ITER {iteration}] Filtering final point cloud using masks...")
-                filter_and_save(scene, mask_dir=mask_dir, iteration=iteration, K=topk_contrib)
+                # filter_and_save(scene, mask_dir=mask_dir, iteration=iteration, K=topk_contrib, semantic_threshold=semantic_threshold)
+                filter_and_save( scene,
+                    mask_dir,
+                    iteration,
+                    K=topk_contrib,
+                    K_keep=topk_contrib,         
+                    semantic_threshold=semantic_threshold,
+                    semantic_use_sigmoid=False,
+                    storage_device="cpu",
+                    missing_mask_policy="all_white")
 
 
 def prepare_output_and_logger(args):    
@@ -363,6 +374,8 @@ if __name__ == "__main__":
                     help="Path to folder containing binary masks for filtering the final point cloud")
     parser.add_argument("--topk_contrib", type=int, default=8,
                     help="Number of top contributors per pixel for filtering")
+    parser.add_argument("--sem_threshold", type=float, default=0.7,
+                    help="Number of top contributors per pixel for filtering")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -381,7 +394,8 @@ if __name__ == "__main__":
         args.test_iterations, args.save_iterations, args.checkpoint_iterations,
         args.start_checkpoint, args.debug_from,
         mask_dir=args.mask_dir,
-        topk_contrib=  args.topk_contrib
+        topk_contrib=args.topk_contrib,
+        semantic_threshold=args.sem_threshold
     )
 
     # All done
