@@ -1,9 +1,7 @@
 # Ignore unwanted folders
 data/temp/
 logs/
-SIBR_viewers/
-submodules/fused-ssim/
-submodules/simple-knn/
+
 *.pyc
 .vscode
 output
@@ -12,12 +10,7 @@ tensorboard_3d
 screenshots
 
 # Backups
-submodules_backup/
-diff_rast_backup/
 *.zip
-
-# External experiments
-submodules/pytorch3d/
 
 # Build artifacts
 __pycache__/
@@ -29,6 +22,6 @@ dist/
 
 # Personal / debug folders
 debug_masks_instances/
-old_script/
+old_scripts/
 istruzioni/
 samuele/
