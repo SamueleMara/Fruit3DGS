@@ -19,7 +19,7 @@ Samuele Mara, Angelo Moroncelli, Marco Maccarini, Loris Roveda
 ## 🖼 Graphical Abstract
 
 <p align="center">
-<img src="assets/Fruit3DGS_visual_abstract.png" width="1000">
+<img src="assets/graphical_abstract.png" width="1000">
 </p>
 
 ---
@@ -103,6 +103,19 @@ Please cite both the original 3DGS paper and our work.
 - JSON export for robotic picking  
 
 ---
+
+## 🖼 Qualitative Results
+
+### 🍋🍎🍏 Fruit Counting Results
+
+<p align="center">
+<img src="assets/results_counting.png" width="1000">
+</p>
+
+### 📍 Fruit Localization Results
+<p align="center">
+<img src="assets/results_localization.png" width="1000">
+</p>
 
 ## 📊 Quantitative Results
 
