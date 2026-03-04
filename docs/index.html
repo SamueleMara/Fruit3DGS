@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Fruit3DGS: Fruit Counting and Localization</title>
+
+<link rel="stylesheet" href="style.css">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>Fruit3DGS</h1>
+
+<h2 class="subtitle">
+A General Fruit Counting and Localization Framework Leveraging
+Semantic-Guided 3D Gaussian Splatting and Contrastive Learning
+</h2>
+
+<div class="authors">
+
+<b>Samuele Mara</b><sup>1,2</sup>,
+Angelo Moroncelli<sup>1,2</sup>,
+Marco Maccarini<sup>1,2</sup>,
+Loris Roveda<sup>1,3</sup>
+
+</div>
+
+<div class="affiliations">
+
+<sup>1</sup> IDSIA – Dalle Molle Institute for Artificial Intelligence, USI-SUPSI, Lugano, Switzerland<br>
+<sup>2</sup> Università della Svizzera Italiana (USI), Lugano, Switzerland<br>
+<sup>3</sup> Politecnico di Milano, Department of Mechanical Engineering, Italy
+
+</div>
+
+<div class="links">
+<!-- <a href="assets/datasets/main.pdf">📄 Paper</a> -->
+<a href="https://github.com/SamueleMara/Fruit_3DGS">💻 Code</a>
+<a href="assets/datasets/">📊 Dataset</a>
+</div>
+
+
+<figure class="figure-block">
+<img class="figure" src="assets/images/Fruit3DGS_visual_abastract.png">
+<figcaption class="figure-caption">
+Visual abstract of the Fruit3DGS framework.
+</figcaption>
+</figure>
+
+
+<section>
+
+<h3 class="section-title">Abstract</h3>
+
+<div class="abstract">
+
+<p>
+Fruit counting and localization are essential for yield estimation and robotic harvesting in modern orchards.
+Fruit3DGS introduces a semantic-guided 3D Gaussian Splatting framework combined with contrastive learning
+to reconstruct high-fidelity 3D models and extract individual fruit instances from unordered image collections.
+The framework produces semantically aware Gaussian primitives enriched with instance-discriminative embeddings,
+allowing robust clustering and accurate 3D localization for robotic harvesting tasks.
+</p>
+
+</div>
+
+</section>
+
+
+<section>
+
+<h3>Pipeline Overview</h3>
+
+<figure class="figure-block">
+<img class="figure" src="assets/images/Fruit3DGS_pipeline.png">
+<figcaption class="figure-caption">
+Overview of the Fruit3DGS pipeline: semantic lifting, contrastive embedding learning,
+and clustering of Gaussian primitives for instance localization.
+</figcaption>
+</figure>
+
+</section>
+
+
+<section>
+
+<h3>Semantic Training</h3>
+
+<figure class="figure-block">
+<img class="figure" src="assets/images/Fruit3DGS_semantic_training.png">
+<figcaption class="figure-caption">
+Semantic embedding training where Gaussian primitives learn foreground probabilities
+supervised by segmentation masks.
+</figcaption>
+</figure>
+
+</section>
+
+
+<section>
+
+<h3>Instance Embedding Training</h3>
+
+<figure class="figure-block">
+<img class="figure" src="assets/images/Fruit3DGS_instance_training.png">
+<figcaption class="figure-caption">
+Contrastive instance embedding learning using multi-view instance masks
+to enforce instance-consistent Gaussian embeddings.
+</figcaption>
+</figure>
+
+</section>
+
+
+<section>
+
+<h3>Instance Clustering</h3>
+
+<figure class="figure-block">
+<img class="figure" src="assets/images/Fruit3DGS_instance_clustering.png">
+<figcaption class="figure-caption">
+Embedding-augmented clustering of Gaussian primitives to recover fruit instances
+and compute 3D oriented bounding boxes.
+</figcaption>
+</figure>
+
+</section>
+
+
+<section>
+
+<h3>Fruit Counting Results</h3>
+
+<figure class="figure-block">
+<img class="figure" src="assets/images/Fruit3DGS_results.png">
+<figcaption class="figure-caption">
+Qualitative fruit counting results across multiple datasets including Lemons,
+Sunflowers, Multi-fruit, Tree01–Tree03, Fuji, and Brandenburg.
+</figcaption>
+</figure>
+
+</section>
+
+
+<section>
+
+<h3>Counting Results (Baseline Datasets)</h3>
+
+<table class="results-table">
+
+<tr>
+<th>Dataset</th>
+<th>FruitNeRF</th>
+<th>FruitLangGS</th>
+<th>Fruit3DGS HDBSCAN</th>
+<th>Fruit3DGS</th>
+<th>Ground Truth</th>
+</tr>
+
+<tr><td>Tree01</td><td>173</td><td><b>173</b></td><td>193</td><td>187</td><td>179</td></tr>
+<tr><td>Tree02</td><td><b>112</b></td><td>110</td><td>158</td><td>108</td><td>113</td></tr>
+<tr><td>Tree03</td><td>264</td><td><b>287</b></td><td>304</td><td>273</td><td>291</td></tr>
+<tr><td>Fuji-SfM</td><td>1459</td><td>1443</td><td>2795</td><td><b>1445</b></td><td>1455</td></tr>
+
+</table>
+
+</section>
+
+
+<section>
+
+<h3>Generalization Results</h3>
+
+<table class="results-table">
+
+<tr>
+<th>Dataset</th>
+<th>FruitNeRF</th>
+<th>Fruit3DGS HDBSCAN</th>
+<th>Fruit3DGS</th>
+<th>Ground Truth</th>
+</tr>
+
+<tr><td>Lemons</td><td>124</td><td>3</td><td><b>3</b></td><td>3</td></tr>
+<tr><td>Sunflowers</td><td>109</td><td>8</td><td><b>6</b></td><td>5</td></tr>
+<tr><td>Multi-Fruit</td><td>18</td><td>8</td><td><b>7</b></td><td>6</td></tr>
+<tr><td>Brandenburg</td><td>0</td><td>1199</td><td><b>2227</b></td><td>3293</td></tr>
+
+</table>
+
+</section>
+
+
+<section>
+
+<h3>Fruit Localization</h3>
+
+<figure class="figure-block">
+<img class="figure" src="assets/images/Fruit3DGS_results_localization.png">
+<figcaption class="figure-caption">
+Fruit localization results obtained using a Franka EMIKA Panda robot
+equipped with a RealSense D405 camera.
+</figcaption>
+</figure>
+
+</section>
+
+
+<section>
+
+<h3>Localization Accuracy</h3>
+
+<h4>Lemon Scene</h4>
+
+<table class="results-table">
+
+<tr>
+<th>Pipeline</th>
+<th>Mean Error (cm)</th>
+<th>Min Error (cm)</th>
+<th>Max Error (cm)</th>
+</tr>
+
+<tr>
+<td>FruitNeRF</td>
+<td>172.1</td>
+<td>164.3</td>
+<td>186.1</td>
+</tr>
+
+<tr>
+<td><b>Fruit3DGS</b></td>
+<td><b>6.4</b></td>
+<td><b>5.4</b></td>
+<td><b>7.4</b></td>
+</tr>
+
+</table>
+
+
+<h4>Multi-Fruit Scene</h4>
+
+<table class="results-table">
+
+<tr>
+<th>Pipeline</th>
+<th>Mean Error (cm)</th>
+<th>Min Error (cm)</th>
+<th>Max Error (cm)</th>
+</tr>
+
+<tr>
+<td>Fruit3DGS</td>
+<td><b>3.2</b></td>
+<td><b>2.2</b></td>
+<td><b>4.9</b></td>
+</tr>
+
+</table>
+
+</section>
+
+
+<!-- <section>
+
+<h3>Citation</h3>
+
+<pre class="citation">
+
+@article{mara2026fruit3dgs,
+title={Fruit3DGS: Fruit counting and localization using 3D Gaussian Splatting},
+author={Mara, Samuele and Moroncelli, Angelo and Maccarini, Marco and Roveda, Loris},
+journal={Computers and Electronics in Agriculture},
+year={2026}
+
+}
+
+</pre>
+
+</section> -->
+
+</div>
+
+</body>
+
+</html>

@@ -1,0 +1,192 @@
+body {
+
+font-family: 'Inter', sans-serif;
+background: white;
+color: #222;
+margin: 0;
+
+}
+
+.container {
+
+max-width: 1100px;
+margin: auto;
+padding: 40px;
+
+}
+
+h1 {
+
+text-align: center;
+font-size: 52px;
+margin-bottom: 10px;
+
+}
+
+.subtitle {
+
+text-align: center;
+font-weight: 400;
+color: #444;
+
+}
+
+.authors {
+
+text-align: center;
+margin-top: 20px;
+font-size: 20px;
+
+}
+
+.affiliations {
+
+text-align: center;
+color: #555;
+margin-bottom: 20px;
+
+}
+
+.links {
+
+text-align: center;
+margin-bottom: 30px;
+
+}
+
+.links a {
+
+margin: 0 15px;
+font-size: 18px;
+font-weight: 600;
+text-decoration: none;
+
+}
+
+.hero img {
+
+width: 100%;
+border-radius: 10px;
+box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+
+}
+
+section {
+
+margin-top: 60px;
+
+}
+
+.figure {
+
+width: 100%;
+margin-top: 20px;
+border-radius: 10px;
+box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+
+transition: transform 0.3s;
+
+}
+
+.figure:hover {
+
+transform: scale(1.02);
+
+}
+
+.results-table {
+
+width: 85%;
+margin-left: auto;
+margin-right: auto;
+border-collapse: collapse;
+margin-top: 20px;
+
+}
+
+.results-table th,
+.results-table td {
+
+border: 1px solid #ddd;
+padding: 10px;
+text-align: center;
+
+}
+
+.results-table th {
+
+background-color: #f4f4f4;
+
+}
+
+pre {
+
+background: #f6f6f6;
+padding: 20px;
+overflow-x: auto;
+
+}
+
+.section-title {
+
+text-align: center;
+margin-bottom: 15px;
+
+}
+
+.abstract {
+
+max-width: 850px;
+margin-left: auto;
+margin-right: auto;
+
+}
+
+.abstract p {
+
+text-align: justify;
+font-size: 18px;
+line-height: 1.7;
+
+}
+
+section h3 {
+
+text-align: center;
+margin-bottom: 15px;
+
+}
+
+section h4 {
+
+text-align: center;
+margin-top: 25px;
+
+}
+
+.figure-caption {
+
+text-align: center;
+font-size: 15px;
+margin-top: 10px;
+color: #444;
+
+}
+
+.figure-block {
+
+text-align: center;
+margin-top: 30px;
+
+}
+
+.citation {
+
+max-width: 700px;
+margin-left: auto;
+margin-right: auto;
+text-align: left;
+background: #f6f6f6;
+padding: 20px;
+
+}
