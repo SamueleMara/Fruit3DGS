@@ -6,7 +6,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
-<title>🍋🍎🍏 Fruit3DGS 🍏🍎🍋 : Fruit Counting and Localization with 3D Gaussian Splatting and Contrastive Learning</title>
+<title>🍋🍎🍏 Fruit3DGS 🍏🍎🍋 </title>
 
 <link rel="stylesheet" href="style.css">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -63,11 +63,15 @@ Visual abstract of the Fruit3DGS framework.
 <div class="abstract">
 
 <p>
-Fruit counting and localization are essential for yield estimation and robotic harvesting in modern orchards.
-Fruit3DGS introduces a semantic-guided 3D Gaussian Splatting framework combined with contrastive learning
-to reconstruct high-fidelity 3D models and extract individual fruit instances from unordered image collections.
-The framework produces semantically aware Gaussian primitives enriched with instance-discriminative embeddings,
-allowing robust clustering and accurate 3D localization for robotic harvesting tasks.
+Fruit counting and localization are essential for yield estimation and robotic harvesting in modern orchards. 
+This study introduces Fruit3DGS, a semantic-guided 3D Gaussian Splatting (3DGS) framework combined with contrastive learning to reconstruct high-fidelity 3D models and extract individual fruit instances from unordered image collections.
+Orchard scenes are captured from multiple viewpoints, and photogrammetry is used to estimate camera parameters and reconstruct a sparse point cloud, which is subsequently optimized into a semantically aware 3DGS model.
+In Fruit3DGS, prompt-driven 2D instance masks are lifted into 3D by augmenting Gaussian primitives with learnable semantic coefficients, while a contrastive embedding field is trained to enforce view-consistent, shape-agnostic instance separation.
+Foreground Gaussians are clustered using an embedding-augmented $k$-nearest-neighbor graph with hyperparameters automatically selected via Bayesian Optimization.
+The method is evaluated on established apple-counting benchmarks and newly collected multi-fruit datasets.
+Fruit3DGS achieves competitive counting accuracy on apple-specific benchmarks while substantially improving generalization to unseen fruit types.
+In real robotic (using a Franka EMIKA panda robot platform) fruit picking experiments, the framework produces centimeter-level localization accuracy, reducing the mean 3D target error from over 170 cm with NeRF-based baselines to below 7 cm.
+  The results demonstrate that combining semantic-guided Gaussian splatting with contrastive embedding learning enables accurate, fruit-agnostic 3D reconstruction and reliable instance-level perception, providing a scalable solution for agricultural robotics and precision farming applications.
 </p>
 
 </div>
