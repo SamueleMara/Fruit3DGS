@@ -1,0 +1,22 @@
+Istruzioni codice salvataggio render per immagini paper:
+
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py   --colmap_dir /workspace/samuele/Colmap/Lemons --model_dir /workspace/output/Lemons   --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py  --colmap_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled --model_dir /workspace/output/Tree_01_new   --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py  --colmap_dir /workspace/samuele/Colmap/tree_02_merged --model_dir /workspace/output/Tree_02_new   --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py  --colmap_dir /workspace/samuele/Colmap/tree_03_merged --model_dir /workspace/output/Tree_03_new   --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py  --colmap_dir /workspace/samuele/Colmap/scaled_both_sides_merged --model_dir /workspace/output/Fuji_new   --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py  --colmap_dir /workspace/samuele/Colmap/girasoli_real/sparse_filtered_scaled_920x1992 --model_dir /workspace/output/girasoli_new   --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py  --colmap_dir /workspace/samuele/deep-image-matching/2022-09-06_scaled --model_dir /workspace/output/2022-09-06_scaled --model_dir /workspace/output/2022-09-06_scaled   --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py --colmap_dir /home/samuelemara/colmap/samuele/girasoli_real  --model_dir /home/samuelemara/gaussian-splatting-seg/output/girasoli --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py --colmap_dir /workspace/samuele/deep-image-matching/lemons_2026-02-19  --model_dir /workspace/output/lemons_2026-02-19 --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python render_images_standalone.py --colmap_dir /workspace/samuele/deep-image-matching/multifruit_2026-02-19  --model_dir /workspace/output/multifruit_2026-02-19 --ply_iteration 30000   --base_ply_name point_cloud.ply   --inst_ply_name filtered_scene_clusters_cc_no_bkg.ply   --semantic_use_sigmoid   --overlay_alpha 0.6   --point_size 8.0  --semantic_gamma 5   --o3d_disable_post --o3d_force_pure_white

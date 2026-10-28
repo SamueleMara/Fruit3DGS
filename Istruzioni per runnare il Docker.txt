@@ -1,0 +1,168 @@
+Istruzioni per runnare il docker fruit_gs:
+
+
+xhost +local:docker  # allow local Docker containers to use X11
+docker run -it \
+  --gpus '"device=all"' \
+  --ipc=host \
+  --memory=110g \
+  --memory-swap=110g \
+  --memory-reservation=90g \
+  -e DISPLAY=$DISPLAY \
+  -e XDG_RUNTIME_DIR=/tmp/runtime-$UID \
+  -e QT_XCB_GL_INTEGRATION=xcb_egl \
+  -e QT_QPA_PLATFORM=xcb \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v $(pwd):/workspace \
+  -p 7007:7007 \
+  --name fruit_gs_gpu0 \
+  fruit_gs:latest \
+  /bin/bash
+
+
+
+Due docker separati:
+
+Primo: 
+
+xhost +local:docker  # allow local Docker containers to use X11
+docker run -it \
+  --gpus '"device=0"' \
+  --ipc=host \
+  --memory=110g \
+  --memory-swap=110g \
+  --memory-reservation=90g \
+  -e DISPLAY=$DISPLAY \
+  -e XDG_RUNTIME_DIR=/tmp/runtime-$UID \
+  -e QT_XCB_GL_INTEGRATION=xcb_egl \
+  -e QT_QPA_PLATFORM=xcb \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v $(pwd):/workspace \
+  -p 7007:7007 \
+  --name fruit_gs_gpu0 \
+  fruit_gs:latest \
+  /bin/bash
+
+Secondo: 
+xhost +local:docker  # allow local Docker containers to use X11
+docker run -it \
+  --gpus '"device=1"' \
+  --ipc=host \
+  --memory=110g \
+  --memory-swap=110g \
+  --memory-reservation=90g \
+  -e DISPLAY=$DISPLAY \
+  -e XDG_RUNTIME_DIR=/tmp/runtime-$UID \
+  -e QT_XCB_GL_INTEGRATION=xcb_egl \
+  -e QT_QPA_PLATFORM=xcb \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v $(pwd):/workspace \
+  -p 7008:7007 \
+  --name fruit_gs_gpu1 \
+  fruit_gs:latest \
+  /bin/bash
+
+
+Training: 
+
+root@2decf491184a:/workspace# PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s /workspace/samuele/Colmap/Lemons   --mask_dir /workspace/samuele/Colmap/Lemons/masks   --topk_contrib 2   --percent_dense 0.001  --data_device cpu
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled   --mask_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled/masks   --topk_contrib 2   --percent_dense 0.001  --data_device cpu
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/Colmap/tree_02_merged --mask_dir /workspace/samuele/Colmap/tree_02_merged/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/Colmap/tree_03_merged --mask_dir /workspace/samuele/Colmap/tree_03_merged/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/Colmap/scaled_both_sides_merged --mask_dir /workspace/samuele/Colmap/scaled_both_sides_merged/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu --sem_threshold 0.3
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/Colmap/Fuji --mask_dir /workspace/samuele/Colmap/Fuji/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu --sem_threshold 0.3
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/Colmap/Fuji_yolo --mask_dir /workspace/samuele/Colmap/Fuji_yolo/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu --sem_threshold 0.3
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/Colmap/girasoli_real/sparse_filtered_scaled_920x1992 --mask_dir /workspace/samuele/Colmap/girasoli_real/sparse_filtered_scaled_920x1992/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu -r 1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/deep-image-matching/2022-09-06_scaled --mask_dir /workspace/samuele/deep-image-matching/2022-09-06_scaled/masks --topk_contrib 2   --percent_dense 0.001  --data_device cpu -r 1 --sem_threshold 0.3
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/36_5 --mask_dir /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/36_5/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu -r 1 --sem_threshold 0.15
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/36_5 --mask_dir /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/36_5/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu -r 1 --sem_threshold 0.15
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/deep-image-matching/lemons_2026-02-19 --mask_dir /workspace/samuele/deep-image-matching/lemons_2026-02-19/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu -r 1 --sem_threshold 0.7
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python train_sem.py -s  /workspace/samuele/deep-image-matching/multifruit_2026-02-19 --mask_dir /workspace/samuele/deep-image-matching/multifruit_2026-02-19/masks  --topk_contrib 2   --percent_dense 0.001  --data_device cpu -r 1 --sem_threshold 0.7
+
+
+
+Output pre-filtering: 
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py --colmap_dir /workspace/samuele/Colmap/scaled_both_sides_merged --model_dir /workspace/output/Fuji_new --mask_dir /workspace/samuele/Colmap/scaled_both_sides_merged/masks --fg_thresh 0.1 --contribs 1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py  --colmap_dir /workspace/samuele/Colmap/Lemons --model_dir /workspace/output/Lemons --mask_dir /workspace/samuele/Colmap/Lemons/masks --fg_thresh 0.1 --contribs 1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py  --colmap_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled --model_dir /workspace/output/tree_01 --mask_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled/masks --fg_thresh 0.1 --contribs 1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py  --colmap_dir /workspace/samuele/Colmap/tree_02_merged --model_dir /workspace/output/tree_02_merged --mask_dir /workspace/samuele/Colmap/tree_02_merged/masks --fg_thresh 0.1 --contribs 1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py  --colmap_dir /workspace/samuele/Colmap/tree_03_merged --model_dir /workspace/output/tree_03_merged --mask_dir /workspace/samuele/Colmap/tree_03_merged/masks --fg_thresh 0.1 --contribs 1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py  --colmap_dir /workspace/samuele/Colmap/scaled_both_sides_merged --model_dir /workspace/output/Fuji_new --mask_dir /workspace/samuele/Colmap/scaled_both_sides_merged/masks --fg_thresh 0.1 --contribs 1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py  --colmap_dir /workspace/samuele/Colmap/Fuji_yolo --mask_dir /workspace/samuele/Colmap/Fuji_yolo/masks --model_dir /workspace/output/Fuji_yolo_sam --fg_thresh 0.1 --contribs 2
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py  --colmap_dir /workspace/samuele/Colmap/girasoli_real/sparse_filtered_scaled_920x1992 --model_dir /workspace/output/girasoli_new --mask_dir /workspace/samuele/Colmap/girasoli_real/sparse_filtered_scaled_920x1992/masks --fg_thresh 0.1 --contribs 1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py --colmap_dir /workspace/samuele/deep-image-matching/2022-09-06_scaled --model_dir /workspace/output/2022-09-06_scaled --mask_dir /workspace/samuele/deep-image-matching/2022-09-06_scaled/masks --fg_thresh 0.5 --contribs 2
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py --colmap_dir /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/36_5 --model_dir /workspace/output/36_5 --mask_dir /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/36_5/masks --fg_thresh 0.15 --contribs 10
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python output_filter_standalone.py --colmap_dir /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/45_49 --model_dir /workspace/output/45_49 --mask_dir /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/45_49/masks --fg_thresh 0.7 --contribs 10
+
+
+
+Clustering: 
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/Lemons --model_dir /workspace/output/Lemons --mask_dir /workspace/samuele/Colmap/Lemons/masks --mask_inst_dir /workspace/samuele/Colmap/Lemons/mask_instances --contribs 2 --iterations 10000 --device cpu --k_centr 10 --cluster_alg dbscan --fg_thresh 0.7
+
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled --model_dir /workspace/output/tree_01 --mask_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled/masks --mask_inst_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled/mask_instances --contribs 1 --iterations 10000 --device cpu --k_centr 1 --cluster_alg dbscan --fg_thresh 0.5
+
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/tree_02_merged --model_dir /workspace/output/tree_02_merged --mask_dir /workspace/samuele/Colmap/tree_02_merged/masks --mask_inst_dir /workspace/samuele/Colmap/tree_02_merged/mask_instances --contribs 1 --iterations 10000 --device cpu --k_centr 1 --cluster_alg dbscan --fg_thresh 0.5
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/tree_03_merged --model_dir /workspace/output/tree_03_merged --mask_dir /workspace/samuele/Colmap/tree_03_merged/masks --mask_inst_dir /workspace/samuele/Colmap/tree_03_merged/mask_instances --contribs 1 --iterations 10000 --device cpu --k_centr 1 --cluster_alg dbscan --fg_thresh 0.5
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/scaled_both_sides_merged --model_dir /workspace/output/Fuji_new --mask_dir /workspace/samuele/Colmap/scaled_both_sides_merged/masks --mask_inst_dir /workspace/samuele/Colmap/scaled_both_sides_merged/mask_instances --contribs 1 --iterations 10000 --device cpu --k_centr 1 --cluster_alg dbscan --fg_thresh 0.5
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/girasoli_real/sparse_filtered_scaled_920x1992 --model_dir /workspace/output/girasoli_new --mask_dir /workspace/samuele/Colmap/girasoli_real/sparse_filtered_scaled_920x1992/masks --mask_inst_dir /workspace/samuele/Colmap/girasoli_real/sparse_filtered_scaled_920x1992/mask_instances --contribs 2 --iterations 15000 --device cpu --k_centr 1 --cluster_alg dbscan --fg_thresh 0.5
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/deep-image-matching/2022-09-06_scaled --model_dir /workspace/output/2022-09-06_scaled --mask_dir /workspace/samuele/deep-image-matching/2022-09-06_scaled/masks --mask_inst_dir /workspace/samuele/deep-image-matching/2022-09-06_scaled/mask_instances --contribs 2 --iterations 15000 --device cpu --k_centr 6 --cluster_alg dbscan --fg_thresh 0.1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/36_5 --model_dir /workspace/output/36_5 --mask_dir /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/36_5/masks --mask_inst_dir /workspace/samuele/deep-image-matching/counted_trees_images_reconstructed/36_5/mask_instances --contribs 1 --iterations 10000 --device cpu --k_centr 1 --cluster_alg dbscan --fg_thresh 0.15
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/deep-image-matching/lemons_2026-02-19 --model_dir /workspace/output/lemons_2026-02-19 --mask_dir /workspace/samuele/deep-image-matching/lemons_2026-02-19/masks --mask_inst_dir /workspace/samuele/deep-image-matching/lemons_2026-02-19/mask_instances --contribs 10 --iterations 15000 --device cpu --k_centr 10 --cluster_alg dbscan --fg_thresh 0.1
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/deep-image-matching/multifruit_2026-02-19 --model_dir /workspace/output/multifruit_2026-02-19 --mask_dir /workspace/samuele/deep-image-matching/multifruit_2026-02-19/masks --mask_inst_dir /workspace/samuele/deep-image-matching/multifruit_2026-02-19/mask_instances --contribs 10 --iterations 15000 --device cpu --k_centr 10 --cluster_alg dbscan --fg_thresh 0.1
+
+
+
+Clustering Tree_01,02,03_new: 
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled --model_dir /workspace/output/Tree_01_new --mask_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled/masks --mask_inst_dir /workspace/samuele/Colmap/tree_01/tree_01_filtered_scaled/mask_instances --contribs 6 --iterations 15000 --device cpu --k_centr 10 --cluster_alg dbscan --fg_thresh 0.7
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/tree_02_merged --model_dir /workspace/output/Tree_02_new --mask_dir /workspace/samuele/Colmap/tree_02_merged/masks --mask_inst_dir /workspace/samuele/Colmap/tree_02_merged/mask_instances --contribs 6 --iterations 15000 --device cpu --k_centr 10 --cluster_alg dbscan --fg_thresh 0.5
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/tree_03_merged --model_dir /workspace/output/Tree_03_new --mask_dir /workspace/samuele/Colmap/tree_03_merged/masks --mask_inst_dir /workspace/samuele/Colmap/tree_03_merged/mask_instances --contribs 6 --iterations 15000 --device cpu --k_centr 10 --cluster_alg dbscan --fg_thresh 0.4
+
+
+Visualization: 
+
+CloudCompare
+
+
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/scaled_both_sides_merged --model_dir /workspace/output/Fuji_yolo_seg --mask_dir /workspace/samuele/Colmap/scaled_both_sides_merged/masks --mask_inst_dir /workspace/samuele/Colmap/scaled_both_sides_merged/mask_instances --contribs 6 --iterations 15000 --device cpu --k_centr 8 --cluster_alg hdbscan --fg_thresh 0.5
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 python filter_standalone.py --colmap_dir /workspace/samuele/Colmap/tree_03_merged --model_dir /workspace/output/Tree_03_new --mask_dir /workspace/samuele/Colmap/tree_03_merged/masks --mask_inst_dir /workspace/samuele/Colmap/tree_03_merged/mask_instances --contribs 1 --iterations 10000 --device cpu --k_centr 1 --cluster_alg hdbscan --fg_thresh 0.4

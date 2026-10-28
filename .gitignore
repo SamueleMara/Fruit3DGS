@@ -1,0 +1,27 @@
+# Ignore unwanted folders
+data/temp/
+logs/
+SIBR_viewers/
+submodules/fused-ssim/
+submodules/simple-knn/
+samuele/
+output/
+out/
+*.pyc
+*.zip
+*.tar
+.vscode
+output
+build
+tensorboard_3d
+screenshots
+revisioned_results/
+contrastive-gaussian-clustering/
+experiments/
+Fruit3DGS_batch_results/
+localization_results_code/
+output_cgc
+output_cgc_10_07_2026
+results
+
+

@@ -1,0 +1,193 @@
+{
+  "repo_root": ".",
+  "python": "python",
+  "results_root": "ablation_runs",
+  "sample_interval_seconds": 2.0,
+  "run_sections": [
+    "direct_dbscan_wide"
+  ],
+  "datasets": [
+    {
+      "name": "lemons_2026-02-19",
+      "colmap_dir": "samuele/datasets/lemons_2026-02-19",
+      "model_dir": "output/lemons_2026-02-19",
+      "sem_mask_dir": "samuele/datasets/lemons_2026-02-19/semantics",
+      "mask_inst_dir": "samuele/datasets/lemons_2026-02-19/mask_instances",
+      "contrastive_objmasks": "masks"
+    },
+    {
+      "name": "multifruit_2026-02-19",
+      "colmap_dir": "samuele/datasets/multifruit_2026-02-19",
+      "model_dir": "output/multifruit_2026-02-19",
+      "sem_mask_dir": "samuele/datasets/multifruit_2026-02-19/semantics",
+      "mask_inst_dir": "samuele/datasets/multifruit_2026-02-19/mask_instances",
+      "contrastive_objmasks": "masks"
+    },
+    {
+      "name": "2022-09-06_scaled",
+      "colmap_dir": "samuele/datasets/2022-09-06_scaled",
+      "model_dir": "output/2022-09-06_scaled",
+      "sem_mask_dir": "samuele/datasets/2022-09-06_scaled/masks",
+      "mask_inst_dir": "samuele/datasets/2022-09-06_scaled/mask_instances",
+      "contrastive_objmasks": "masks"
+    },
+    {
+      "name": "Fuji",
+      "colmap_dir": "samuele/datasets/Fuji",
+      "model_dir": "output/Fuji_new",
+      "sem_mask_dir": "samuele/datasets/Fuji/masks",
+      "mask_inst_dir": "samuele/datasets/Fuji/mask_instances",
+      "contrastive_objmasks": "masks"
+    },
+    {
+      "name": "scaled_both_sides_merged",
+      "colmap_dir": "samuele/datasets/scaled_both_sides_merged",
+      "model_dir": "output/Fuji_new",
+      "sem_mask_dir": "samuele/datasets/scaled_both_sides_merged/masks",
+      "mask_inst_dir": "samuele/datasets/scaled_both_sides_merged/mask_instances",
+      "contrastive_objmasks": "masks",
+      "notes": "This local dataset appears to share the existing Fuji_new model output. Confirm before direct DBSCAN sweeps if you want a different trained model."
+    },
+    {
+      "name": "tree_02_merged",
+      "colmap_dir": "samuele/datasets/tree_02_merged",
+      "model_dir": "output/tree_02_merged",
+      "sem_mask_dir": "samuele/datasets/tree_02_merged/masks",
+      "mask_inst_dir": "samuele/datasets/tree_02_merged/mask_instances",
+      "contrastive_objmasks": "masks"
+    },
+    {
+      "name": "tree_03_merged",
+      "colmap_dir": "samuele/datasets/tree_03_merged",
+      "model_dir": "output/tree_03_merged",
+      "sem_mask_dir": "samuele/datasets/tree_03_merged/masks",
+      "mask_inst_dir": "samuele/datasets/tree_03_merged/mask_instances",
+      "contrastive_objmasks": "masks"
+    },
+    {
+      "name": "girasoli_real",
+      "colmap_dir": "samuele/datasets/girasoli_real",
+      "model_dir": "output/girasoli_new",
+      "sem_mask_dir": "samuele/datasets/girasoli_real/masks",
+      "mask_inst_dir": "samuele/datasets/girasoli_real/mask_instances",
+      "contrastive_objmasks": "masks"
+    }
+  ],
+  "direct_dbscan": {
+    "model_source": "manifest_model_dir",
+    "ply_iteration": 30000,
+    "input_ply_name": "scene_mask_filtered_renderer.ply",
+    "semantic_field": "semantics",
+    "semantic_missing_policy": "all",
+    "algorithm": "auto",
+    "n_jobs": -1,
+    "wide": {
+      "eps_values": [
+        0.0025,
+        0.005,
+        0.01,
+        0.015,
+        0.02,
+        0.03
+      ],
+      "min_samples_values": [
+        5,
+        10,
+        20,
+        35,
+        50
+      ],
+      "xyz_normalize": [
+        "bbox_diag"
+      ]
+    },
+    "fixed": {
+      "eps": 0.01,
+      "min_samples": 20,
+      "xyz_normalize": "bbox_diag"
+    }
+  },
+  "benchmark": {
+    "run_vanilla": true,
+    "run_full_pipeline": true,
+    "run_render": true,
+    "run_paper_render": false,
+    "env": {},
+    "vanilla_train_args": {
+      "iterations": 30000,
+      "save_iterations": [
+        7000,
+        30000
+      ],
+      "test_iterations": [
+        7000,
+        30000
+      ],
+      "disable_viewer": true,
+      "quiet": true
+    },
+    "train_sem_args": {
+      "iterations": 30000,
+      "save_iterations": [
+        7000,
+        30000
+      ],
+      "test_iterations": [
+        7000,
+        30000
+      ],
+      "disable_viewer": true,
+      "quiet": true,
+      "topk_contrib": 8,
+      "sem_threshold": 0.7
+    },
+    "filter_standalone_args": [
+      "--ply_iteration",
+      "30000",
+      "--contribs",
+      "1",
+      "--iterations",
+      "1000",
+      "--lr",
+      "0.0005",
+      "--temperature",
+      "0.1",
+      "--fg_thresh",
+      "0.7",
+      "--k_centr",
+      "10",
+      "--cluster_alg",
+      "hdbscan",
+      "--device",
+      "gpu"
+    ],
+    "render_args": [],
+    "paper_render_args": [
+      "--ply_iteration",
+      "30000",
+      "--load_filtered",
+      "--point_size",
+      "8.0"
+    ]
+  },
+  "contrastive": {
+    "enabled": true,
+    "repo_dir": "contrastive-gaussian-clustering",
+    "objmasks": "masks",
+    "run_render": true,
+    "env": {},
+    "train_args": {
+      "iterations": 30000,
+      "save_iterations": [
+        7000,
+        30000
+      ],
+      "test_iterations": [
+        7000,
+        30000
+      ],
+      "quiet": true
+    },
+    "render_args": []
+  }
+}

@@ -1,0 +1,14 @@
+Tree01: 187
+Tree02: 108
+Tree03: 273
+Fuji-SfM: 1445
+Lemons: 3
+Sunflowers: 6
+Multi–Fruit: 7
+Brandenburg: 2227
+apricot: 2
+avocado: 2
+mango: 2
+multifruit2: 8
+multifruit3:4
+peach: 1
